@@ -12,11 +12,13 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net/http"
 	"os"
 	"strconv"
 	"strings"
 	"sync"
 
+	"reedferry/internal/authui"
 	"reedferry/internal/config"
 	"reedferry/internal/jumpserver"
 	"reedferry/internal/session"
@@ -44,17 +46,180 @@ type REPL struct {
 
 	// connect 连接指定资产；默认调用 session.Run，测试可注入 mock。
 	connect func(a jumpserver.Asset) error
+
+	// login 交互式登录（账号/密码/2FA 输入 + 写配置）；默认走真实登录流程，
+	// 测试可注入 mock。返回 ok=false 表示用户主动取消登录。
+	login func() (ok bool, err error)
 }
 
-// Run 启动交互式 REPL：确保配置 → 显示欢迎与 help → 命令循环。
+// Run 启动交互式 REPL：确保配置 → 按需登录 → 显示欢迎与 help → 命令循环。
 // 资产列表不做自动拉取：首次 list 时惰性拉取（KISS）。
 func Run() error {
 	r := &REPL{pageSize: pageSize}
 	if err := r.loadConfig(); err != nil {
 		return err
 	}
+	if err := r.loginIfNeeded(); err != nil {
+		return err
+	}
 	r.printBanner()
 	return r.loop()
+}
+
+// loginRetryLimit 交互式登录的最多尝试次数（超出后退出登录流程）。
+const loginRetryLimit = 3
+
+// loginIfNeeded 启动时按需登录：Cookie 为空、或现有 Cookie 已失效
+// （401/302/403，经资产树根端点校验）时进入交互式登录，成功后把新会话
+// Cookie 写入配置（沿用 0600 原子写）。
+//
+// 不阻塞启动：用户主动取消（EOF）、网络不可达、登录失败等均打印提示后
+// 继续进 REPL（保留手动编辑配置文件粘贴 Cookie 的工作流）；仅配置写入失败
+// 等致命错误原样返回。
+func (r *REPL) loginIfNeeded() error {
+	// 模板占位 host / 空 host：无法自动登录，提示编辑地址后进 REPL
+	if r.cfg.Host == "" || r.cfg.Host == config.ExampleHost {
+		if r.cfg.Cookie == "" {
+			fmt.Fprintf(os.Stderr, "配置文件 %s 未配置 JumpServer 地址：请编辑填入 host（如 https://your-jumpserver.example.com）后输入 reload 或重启生效\n", config.Path())
+		}
+		return nil
+	}
+	need := r.cfg.Cookie == ""
+	if !need {
+		status, err := jumpserver.VerifySession(context.Background(), r.cfg.Host, r.cfg.Cookie)
+		if err == nil && status == http.StatusOK {
+			return nil
+		}
+		var ae *jumpserver.APIError
+		if !errors.As(err, &ae) {
+			// 网络类错误（不可达/超时）：不阻塞启动，进 REPL 后由 list 报错提示
+			return nil
+		}
+		switch ae.StatusCode {
+		case http.StatusUnauthorized, http.StatusFound, http.StatusForbidden:
+			fmt.Fprintln(os.Stderr, "会话已失效（HTTP", ae.StatusCode, "），开始自动登录")
+			need = true
+		}
+	}
+	if !need {
+		return nil
+	}
+	ok, err := r.interactiveLogin()
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "自动登录未完成：", err)
+	}
+	_ = ok // 登录结果不影响启动（成功/取消/失败均进入 REPL，用户可随时手动 login）
+	return nil
+}
+
+// interactiveLogin 执行一次交互式登录（账号/密码/2FA 隐藏回显输入），
+// 成功后把新 Cookie 写入配置并清空资产缓存（下次 list 重新拉取）。
+// 返回 ok=false 表示用户主动取消登录。测试可注入 r.login 替代网络流程。
+func (r *REPL) interactiveLogin() (ok bool, err error) {
+	if r.login != nil {
+		ok, err = r.login()
+		if err != nil || !ok {
+			return ok, err
+		}
+		// 登录 hook 已更新 r.cfg.Cookie：统一在此持久化（沿用 0600 原子写）
+		if err := r.persistLogin(); err != nil {
+			return false, err
+		}
+		return true, nil
+	}
+	for attempt := 0; ; attempt++ {
+		username, password, err := authui.ReadCredentials(os.Stdin, os.Stdout)
+		if err != nil {
+			if errors.Is(err, authui.ErrNotTTY) || errors.Is(err, io.EOF) {
+				fmt.Fprintln(os.Stderr, "已取消登录；可编辑配置文件填入 Cookie 后输入 reload 生效")
+				return false, nil
+			}
+			return false, err
+		}
+		flow, err := jumpserver.NewLoginFlow(context.Background(), r.cfg.Host)
+		if err != nil {
+			return false, err
+		}
+		outcome, err := flow.SubmitCredentials(context.Background(), username, password)
+		if err != nil {
+			var le *jumpserver.LoginError
+			if errors.As(err, &le) {
+				switch le.Kind {
+				case jumpserver.LoginErrBadCredentials, jumpserver.LoginErrCaptcha:
+					// 账号密码错/图形验证码：提示后重新输入（最多 loginRetryLimit 次）
+					fmt.Fprintln(os.Stderr, "登录失败：", le.Msg)
+					if attempt+1 >= loginRetryLimit {
+						return false, fmt.Errorf("连续 %d 次登录失败，已退出登录流程（可稍后重试，或改用浏览器登录后复制 Cookie）", loginRetryLimit)
+					}
+					continue
+				default:
+					// 扫码/第三方登录、国密环境：环境不支持，直接返回给用户说明
+					return false, err
+				}
+			}
+			return false, err
+		}
+		// 2FA 挑战：循环直至登录完成（RunMFA 内部处理验证码错误重试）
+		for outcome.NeedMFA {
+			outcome, err = authui.RunMFA(context.Background(), flow, outcome.Prompt, os.Stdin, os.Stdout)
+			if err != nil {
+				if errors.Is(err, authui.ErrNotTTY) || errors.Is(err, io.EOF) {
+					fmt.Fprintln(os.Stderr, "已取消登录")
+					return false, nil
+				}
+				return false, err
+			}
+		}
+		// 登录完成：写入配置（沿用 0600 原子写，见 config.Save）
+		r.cfg.Cookie = outcome.Cookie
+		if err := r.persistLogin(); err != nil {
+			return false, err
+		}
+		return true, nil
+	}
+}
+
+// persistLogin 把已更新的会话 Cookie 写入配置并清空资产缓存。
+func (r *REPL) persistLogin() error {
+	if err := config.Save(r.cfg); err != nil {
+		return fmt.Errorf("登录成功但写入配置失败：%w", err)
+	}
+	r.assets = nil // 新会话：清空资产缓存，下次 list 重新拉取
+	fmt.Fprintln(os.Stdout, "登录成功，会话 Cookie 已写入配置文件（本次输入的账号密码不会保存）")
+	return nil
+}
+
+// cmdLogin 手动触发重新登录（login 命令）。
+func (r *REPL) cmdLogin() error {
+	ok, err := r.interactiveLogin()
+	if err != nil {
+		return err
+	}
+	if ok {
+		r.cmdList()
+	}
+	return nil
+}
+
+// maybeRelogin 在 API/会话因 401/302/403 失效时发起交互式登录；
+// 成功换取新 Cookie 并写入配置后返回 true（调用方重试原操作）。
+func (r *REPL) maybeRelogin(err error) bool {
+	var ae *jumpserver.APIError
+	if !errors.As(err, &ae) {
+		return false
+	}
+	switch ae.StatusCode {
+	case http.StatusUnauthorized, http.StatusFound, http.StatusForbidden:
+		fmt.Fprintln(os.Stderr, "会话已失效（HTTP", ae.StatusCode, "），开始重新登录")
+	default:
+		return false
+	}
+	ok, lerr := r.interactiveLogin()
+	if lerr != nil {
+		fmt.Fprintln(os.Stderr, "重新登录失败：", lerr)
+		return false
+	}
+	return ok
 }
 
 // printBanner 输出简短欢迎与命令帮助。
@@ -67,7 +232,7 @@ func (r *REPL) printBanner() {
 	r.cmdHelp()
 }
 
-// loadConfig 确保配置存在（缺失时自动创建示例模板）；Cookie 为空时提示编辑。
+// loadConfig 确保配置存在（缺失时自动创建示例模板）；Cookie 为空时提示编辑或登录。
 func (r *REPL) loadConfig() error {
 	cfg, err := config.EnsureConfig()
 	if err != nil {
@@ -75,16 +240,22 @@ func (r *REPL) loadConfig() error {
 	}
 	r.cfg = cfg
 	if cfg.Cookie == "" {
-		fmt.Printf("配置文件 %s 中 Cookie 为空：请编辑该文件填入 Cookie（浏览器登录后 F12 → Network → 任选请求 → 复制 Cookie 请求头），然后输入 reload 或重启生效。\n", config.Path())
+		fmt.Printf("配置文件 %s 中 Cookie 为空：可直接输入 login 或重启 reedferry 交互式登录；也可编辑该文件填入 Cookie（浏览器登录后 F12 → Network → 任选请求 → 复制 Cookie 请求头），然后输入 reload 或重启生效。\n", config.Path())
 	}
 	return nil
 }
 
-// fetchAssets 拉取资产列表（API 全量，本地过滤/分页）。
+// fetchAssets 拉取资产列表（API 全量，本地过滤/分页）；
+// 会话失效（401/302/403）时自动触发重新登录并重试一次。
 func (r *REPL) fetchAssets() error {
 	assets, err := jumpserver.ListAssets(context.Background(), r.cfg.Host, r.cfg.Cookie)
 	if err != nil {
-		return err
+		if r.maybeRelogin(err) {
+			assets, err = jumpserver.ListAssets(context.Background(), r.cfg.Host, r.cfg.Cookie)
+		}
+		if err != nil {
+			return err
+		}
 	}
 	r.assets = assets
 	r.filter = ""
@@ -218,6 +389,8 @@ func (r *REPL) runCommand(line string) error {
 		return nil
 	case line == "reload" || line == "r":
 		return r.cmdReload()
+	case line == "login":
+		return r.cmdLogin()
 	case line == "help" || line == "?":
 		r.cmdHelp()
 		return nil
@@ -311,6 +484,7 @@ func (r *REPL) cmdReload() error {
 
 // connectAsset 建立终端会话；会话结束后回到 REPL。
 // 会话期间把 stdin 分发切换到会话 channel（sessCh），结束后切回命令模式。
+// 会话因 401/302/403 断开（Cookie 失效）时自动重新登录并重试一次连接。
 func (r *REPL) connectAsset(a jumpserver.Asset) error {
 	if r.connect != nil {
 		return r.connect(a)
@@ -327,7 +501,15 @@ func (r *REPL) connectAsset(a jumpserver.Asset) error {
 		r.sessMu.Unlock()
 	}()
 
-	err := session.Run(context.Background(), r.cfg, a.ID, session.Options{Input: &chanReader{ch: sessCh}})
+	connect := func() error {
+		return session.Run(context.Background(), r.cfg, a.ID, session.Options{Input: &chanReader{ch: sessCh}})
+	}
+	err := connect()
+	if err != nil && r.maybeRelogin(err) {
+		// 已重新登录并写入新 Cookie：重试一次连接
+		fmt.Printf("已重新登录，再次连接 %s（%s）...\n", a.Hostname, a.Address)
+		err = connect()
+	}
 	if err != nil {
 		fmt.Printf("连接已断开：%v\n", err)
 	} else {
@@ -346,6 +528,7 @@ func (r *REPL) cmdHelp() {
   <编号>           直接连接列表中的资产
   <主机名或IP>      直接输入名称连接
   reload / r       重新拉取资产（编辑配置文件后生效）
+  login            重新登录（交互式输入账号密码，自动更新会话 Cookie）
   help / ?         显示本帮助
   exit / quit      退出（Ctrl-D 同样可退出）
 `)

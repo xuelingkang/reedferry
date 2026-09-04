@@ -281,3 +281,138 @@ func TestLoopEOFExit(t *testing.T) {
 	}
 	_ = old
 }
+
+// ---------- 自动登录编排 ----------
+
+// fakeHTTPServer 构造 httptest 服务端并返回其地址（repl 包测试本地辅助）。
+func fakeHTTPServer(t *testing.T, h http.HandlerFunc) string {
+	t.Helper()
+	srv := httptest.NewServer(h)
+	t.Cleanup(srv.Close)
+	return srv.URL
+}
+
+// maybeRelogin 只在 APIError(401/302/403) 时触发登录；其他错误不触发
+func TestMaybeReloginOnlyOnAuthError(t *testing.T) {
+	r, _ := newTestREPL(t, nil)
+	r.login = func() (bool, error) { return true, nil }
+
+	if r.maybeRelogin(&jumpserver.APIError{StatusCode: http.StatusUnauthorized, Message: "x"}) != true {
+		t.Error("401 should trigger relogin")
+	}
+	if r.maybeRelogin(&jumpserver.APIError{StatusCode: http.StatusFound, Message: "x"}) != true {
+		t.Error("302 should trigger relogin")
+	}
+	if r.maybeRelogin(&jumpserver.APIError{StatusCode: http.StatusForbidden, Message: "x"}) != true {
+		t.Error("403 should trigger relogin")
+	}
+	// 404 等非会话失效错误：不触发登录
+	if r.maybeRelogin(&jumpserver.APIError{StatusCode: http.StatusNotFound, Message: "x"}) != false {
+		t.Error("404 should not trigger relogin")
+	}
+	// 网络类错误（非 APIError）：不触发
+	if r.maybeRelogin(errors.New("connection refused")) != false {
+		t.Error("network error should not trigger relogin")
+	}
+	// 登录失败（login 返回 err）：不触发重试
+	r.login = func() (bool, error) { return false, errors.New("登录失败") }
+	if r.maybeRelogin(&jumpserver.APIError{StatusCode: http.StatusUnauthorized, Message: "x"}) != false {
+		t.Error("failed login should not trigger retry")
+	}
+}
+
+// fetchAssets 在会话失效时先登录再重试拉取
+func TestFetchAssetsReloginRetry(t *testing.T) {
+	calls := 0
+	host := fakeHTTPServer(t, func(w http.ResponseWriter, r *http.Request) {
+		calls++
+		if calls == 1 {
+			http.Redirect(w, r, "/core/auth/login/", http.StatusFound) // 首次 302
+			return
+		}
+		_, _ = w.Write([]byte(`[{"id":"a1","name":"web-01","title":"203.0.113.1","meta":{"type":"asset","data":{}}}]`))
+	})
+	r := &REPL{cfg: &config.Config{Host: host, Cookie: "old"}, pageSize: pageSize}
+	relogined := false
+	r.login = func() (bool, error) {
+		relogined = true
+		r.cfg.Cookie = "new"
+		return true, nil
+	}
+	if err := r.fetchAssets(); err != nil {
+		t.Fatalf("fetchAssets: %v", err)
+	}
+	if !relogined {
+		t.Error("expect relogin on 302")
+	}
+	if len(r.assets) != 1 || r.assets[0].Hostname != "web-01" {
+		t.Errorf("assets after relogin retry: %+v", r.assets)
+	}
+}
+
+// fetchAssets 会话失效但用户取消登录：返回原错误
+func TestFetchAssetsReloginCancelled(t *testing.T) {
+	calls := 0
+	host := fakeHTTPServer(t, func(w http.ResponseWriter, r *http.Request) {
+		calls++
+		http.Redirect(w, r, "/core/auth/login/", http.StatusFound)
+	})
+	r := &REPL{cfg: &config.Config{Host: host, Cookie: "old"}, pageSize: pageSize}
+	r.login = func() (bool, error) { return false, nil } // 用户取消
+	err := r.fetchAssets()
+	if err == nil {
+		t.Fatal("want error when login cancelled")
+	}
+	var ae *jumpserver.APIError
+	if !errors.As(err, &ae) || ae.StatusCode != http.StatusFound {
+		t.Errorf("want original 302 APIError, got %v", err)
+	}
+}
+
+// interactiveLogin：登录成功写入配置并清空资产缓存
+func TestInteractiveLoginWritesConfig(t *testing.T) {
+	dir := t.TempDir()
+	t.Setenv("HOME", dir)
+	cfg, err := config.EnsureConfig()
+	if err != nil {
+		t.Fatal(err)
+	}
+	r := &REPL{cfg: cfg, pageSize: pageSize, assets: mkAssets(2)}
+	r.login = func() (bool, error) {
+		cfg.Cookie = "newcookie"
+		return true, nil
+	}
+	ok, err := r.interactiveLogin()
+	if err != nil || !ok {
+		t.Fatalf("interactiveLogin: ok=%v err=%v", ok, err)
+	}
+	onDisk, err := config.Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if onDisk.Cookie != "newcookie" {
+		t.Errorf("config not persisted: %q", onDisk.Cookie)
+	}
+	if len(r.assets) != 0 {
+		t.Errorf("assets cache should be cleared after login, got %d", len(r.assets))
+	}
+}
+
+// loginIfNeeded：占位/空 host 时跳过登录流程（不阻塞启动）
+func TestLoginIfNeededTemplateHost(t *testing.T) {
+	dir := t.TempDir()
+	t.Setenv("HOME", dir)
+	cfg, err := config.EnsureConfig()
+	if err != nil {
+		t.Fatal(err)
+	}
+	r := &REPL{cfg: cfg, pageSize: pageSize}
+	called := false
+	r.login = func() (bool, error) { called = true; return true, nil }
+	if err := r.loginIfNeeded(); err != nil {
+		t.Fatalf("loginIfNeeded: %v", err)
+	}
+	if called {
+		t.Error("template host should not trigger login")
+	}
+}

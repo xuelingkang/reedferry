@@ -13,7 +13,8 @@ Reedferry 让本地终端借道 Web 通道连接 JumpServer 资产，全程仍�
 ## 特性
 
 - 交互式 REPL：资产列表分页、关键字过滤、编号/主机名/IP 直连
-- 认证复用浏览器登录会话（Cookie），不触碰 MFA 登录流程
+- 程序内登录：Cookie 为空或失效时交互式输入账号/密码（密码隐藏回显），支持 JumpServer 2FA（TOTP）动态验证码，登录成功自动写入会话 Cookie
+- 兼容手动复制 Cookie：保留浏览器登录后 F12 复制 Cookie 请求头的工作流（`login` 命令 / 编辑 config.json 均可）
 - 纯透传：本地终端字节流与 koko WebSocket 双向透传（v3 协议，Text JSON 控制帧 + Binary 裸字节数据帧）
 - 本地终端手感：raw mode、尺寸同步、30s 心跳保活、优雅退出
 - 单二进制交付，无外部依赖
@@ -42,18 +43,36 @@ GOOS=linux GOARCH=amd64 go build -o reedferry-linux-amd64 ./cmd/reedferry
 
 ## 快速开始
 
-1. 浏览器登录 JumpServer（过 MFA）
-2. 复制会话 Cookie：F12 → Network → 任选一个请求 → Request Headers → **Cookie 行** → 复制
-3. 首次运行 `reedferry` 会自动创建配置文件 `~/.config/reedferry/config.json`（示例模板），编辑填入 JumpServer 地址与 Cookie：
+### 方式一：程序内自动登录（推荐）
+
+1. 首次运行 `reedferry` 会自动创建配置文件 `~/.config/reedferry/config.json`，编辑填入 JumpServer 地址：
 
    ```json
    {
      "host": "https://your-jumpserver.example.com",
-     "cookie": "sessionid=xxx; csrftoken=yyy"
+     "cookie": ""
    }
    ```
 
-4. 重新运行 `reedferry`，输入 `list` 查看资产，输入编号或主机名连接
+2. 重新运行 `reedferry`：Cookie 为空时进入交互式登录，输入 JumpServer 账号与密码（密码隐藏回显），若系统要求 2FA 则输入动态验证码
+3. 登录成功自动把会话 Cookie 写入配置文件，直接输入 `list` 查看资产、输入编号或主机名连接
+
+### 方式二：手动复制 Cookie（原有方式）
+
+1. 浏览器登录 JumpServer（过 MFA）
+2. 复制会话 Cookie：F12 → Network → 任选一个请求 → Request Headers → **Cookie 行** → 复制
+3. 编辑 `~/.config/reedferry/config.json` 填入 Cookie：
+
+   ```json
+   {
+     "host": "https://your-jumpserver.example.com",
+     "cookie": "sessionid=xxx; jms_csrftoken=yyy"
+   }
+   ```
+
+4. 重新运行 `reedferry`（或会话失效时在 REPL 内输入 `reload` 重新拉取）
+
+> 会话失效（401/302/403）时程序会自动提示并重新登录，无需手动处理。
 
 ## 命令
 
@@ -65,6 +84,7 @@ prev / p         上一页
 <编号>           直接连接列表中的资产
 <主机名或IP>      直接输入名称连接
 reload / r       重新拉取资产（编辑配置文件后生效）
+login            重新登录（交互式输入账号密码，自动更新会话 Cookie）
 help / ?         显示本帮助
 exit / quit      退出（Ctrl-D 同样可退出）
 ```
@@ -75,7 +95,7 @@ exit / quit      退出（Ctrl-D 同样可退出）
 本地终端 (raw mode)  ←→  koko WebSocket (wss://)  ←→  JumpServer 资产
 ```
 
-1. **认证**：复用浏览器登录会话 Cookie（含 `sessionid`/`jms_csrftoken`），不自动化登录
+1. **认证**：会话 Cookie 两种来源——程序内交互式登录（账号密码 + 可选 2FA，密码传输按服务端下发 RSA/AES 加密协议，登录成功后自动写入配置）；或手动复制浏览器会话 Cookie 粘贴到配置。API 请求带 `sessionid`/`jms_csrftoken`，CSRF 头取 `jms_csrftoken`
 2. **建连**：`POST /api/v1/authentication/connection-token/` 创建连接 token（带 CSRF 头），再以 `wss://{host}/koko/ws/terminal/?token={token}` 握手
 3. **传输**：Text 帧为 JSON 控制消息（CONNECT/CLOSE 等），Binary 帧为原始终端字节流，双向透传
 
@@ -86,15 +106,16 @@ exit / quit      退出（Ctrl-D 同样可退出）
 | 字段 | 说明 |
 | --- | --- |
 | `host` | JumpServer 地址，如 `https://your-jumpserver.example.com` |
-| `cookie` | 浏览器会话 Cookie（含登录凭据，请勿提交至版本库） |
+| `cookie` | 会话 Cookie（登录凭据，请勿提交至版本库）。可由程序内登录自动写入，也可手动粘贴浏览器 Cookie |
 
-首次运行自动创建示例模板；编辑后 `reload` 生效或重启程序。
+首次运行自动创建示例模板（host 占位、cookie 为空）；Cookie 为空或失效时程序会引导交互式登录；编辑后 `reload` 生效或重启程序。
 
 ## 安全说明
 
 - Cookie 等价于浏览器登录态，配置文件请妥善保管（默认 0600 权限）
+- 账号密码与 2FA 验证码仅用于本次会话换取 Cookie：输入时隐藏回显，不打印、不写日志、不落盘，任何情况下不持久化
+- 密码传输遵循 JumpServer 登录协议：服务端下发 RSA 公钥，密码经 AES/ECB 加密、密钥经 RSA 加密后提交（与浏览器一致）
 - 连接仍经 JumpServer koko Web 通道，审计记录与浏览器 Web 终端一致
-- 本项目不自动化登录流程，不绕过 MFA
 
 ## 技术栈
 

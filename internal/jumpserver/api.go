@@ -118,7 +118,7 @@ func classifyError(status int) error {
 	case http.StatusFound, http.StatusUnauthorized, http.StatusForbidden:
 		// 302 跳登录页 / 401 / 403 均视为会话失效
 		return &APIError{StatusCode: status, Message: fmt.Sprintf(
-			"会话可能已失效（HTTP %d），请运行 `reedferry config test` 校验，必要时重新粘贴 Cookie", status)}
+			"会话可能已失效（HTTP %d）：请输入 login 重新登录，或编辑配置文件重新粘贴 Cookie 后 reload", status)}
 	case http.StatusNotFound:
 		// 当前实测端点见设计文档附录 D V1/V2 回填；仍 404 说明部署环境与实测不一致
 		return &APIError{StatusCode: status, Message: fmt.Sprintf(

@@ -7,6 +7,7 @@
 | 修订人 | 内容 | 修订时间 |
 | --- | --- | --- |
 | 设计助手（AI Agent） | 详细设计定稿：交互式 REPL、模块划分、WebSocket 协议（协议实测结论见附录 D） | 2026-08-13 |
+| 开发（AI Agent） | 新增自动登录：程序内交互式登录换取会话 Cookie（含 2FA），登录流程实测结论见附录 D V5；新增 authui 模块 | 2026-09-04 |
 
 # 1. 项目概述
 
@@ -26,7 +27,7 @@ Web 终端能力在线、审计链路完整，但浏览器终端缺少本地终�
 | --- | --- |
 | S1：本地终端可连 JumpServer 资产 | 进入 REPL 后输入编号或主机名即可进入远端 shell，输入输出即时回显 |
 | S2：交互式 REPL | 直接运行 `reedferry` 进入交互模式：资产列表分页、关键字过滤、编号/主机名直连，无学习成本 |
-| S3：认证复用浏览器会话 | 全程无需输入 JumpServer 账号密码，不触碰 MFA 登录流程 |
+| S3：认证双通道 | 会话 Cookie 支持两种来源：程序内交互式登录（账号密码 + 可选 2FA）自动写入配置；或手动复制浏览器会话 Cookie 粘贴（原有方式保留） |
 | S4：审计链路不破坏 | 连接仍经 JumpServer koko Web 通道，审计记录与浏览器 Web 终端一致 |
 | S5：单二进制交付 | `go build` 产出单个可执行文件，运行仅依赖目标机终端环境 |
 | S6：协议问题显性化 | 对 API 路径/消息格式的版本差异给出待验证项与验证方法（见附录 D），降低实现风险 |
@@ -38,13 +39,14 @@ Web 终端能力在线、审计链路完整，但浏览器终端缺少本地终�
 - 交互式 REPL：资产列表分页/过滤/编号直连、连接编排、配置引导、help/exit；
 - 配置管理：自动创建示例配置模板、Cookie 为空时引导编辑 `config.json`；
 - 终端连接：本地终端与 koko WebSocket 之间的双向数据通道，支持终端尺寸同步、保活心跳、优雅退出；
+- 自动登录：Cookie 为空/失效时交互式输入账号密码（可选 2FA 动态验证码），登录成功自动把会话 Cookie 写入配置（0600 原子写）；
 - 基础调试能力（`--debug` 打印收发消息）。
 
 **不包含（Non-Goals）：**
 
 - 端口转发 / 文件传输 / SFTP 等 Tunnel 能力（本期 KISS，后续可扩展）；
-- 任何形式的账号密码输入、MFA 流程、扫码登录；
-- 浏览器 Cookie 的自动提取（本期手动复制 Cookie 请求头，自动提取列为后续扩展）；
+- 账号密码以外的认证逻辑扩展：不实现扫码/第三方登录（企业微信/钉钉/飞书/OpenID/CAS/SAML2/OAuth2）、不实现图形验证码自动识别、不实现国密（SM2/SM4）密码加密；这些场景提示用户改用浏览器登录复制 Cookie；
+- 浏览器 Cookie 的自动提取（本期支持手动复制 Cookie 请求头与程序内登录两种方式）；
 - 图形界面、系统托盘、守护进程常驻；
 - 多平台打包（本期面向 macOS 本机，Go 交叉编译能力天然保留）。
 
@@ -55,8 +57,16 @@ Web 终端能力在线、审计链路完整，但浏览器终端缺少本地终�
 ### FR-1 配置管理
 
 - 首次运行：配置文件不存在时**自动创建示例模板**（占位 host + 空 cookie），提示用户编辑 `~/.config/reedferry/config.json`（权限 0600）；
-- 配置存在但 Cookie 为空：启动与 `list` 时提示"请编辑 <路径> 填入 Cookie"（浏览器登录后 F12 → Network → 任选请求 → 复制 Cookie 请求头）；
+- 配置存在但 Cookie 为空：启动时引导交互式登录（输入账号密码，密码隐藏回显），也保留"编辑 <路径> 填入 Cookie"（浏览器登录后 F12 → Network → 任选请求 → 复制 Cookie 请求头）的原有方式；
 - 编辑配置后输入 `reload` 或重启生效；Cookie 脱敏展示（仅前后 8 字符）供核验。
+
+### FR-4 自动登录
+
+- 触发时机：Cookie 为空（首次/清空）、或现有 Cookie 已失效（API 返回 401/302/403）时；REPL 内 `login` 命令可随时手动触发；
+- 交互方式：提示输入 JumpServer 账号与密码（密码隐藏回显，不打印、不写日志、不落盘）；系统要求 2FA 时提示输入 JumpServer 2FA 动态验证码（明确标注为 2FA），验证码错误可重新输入（上限 3 次）；
+- 成功后自动把会话 Cookie 写入配置文件（沿用 0600 原子写），随后 list/连接资产直接可用；
+- 失败区分：账号密码错 / 验证码错 / 网络不可达 / 图形验证码触发 / 扫码/第三方登录环境 / 国密环境，给出可操作提示；
+- 安全约束：账号密码与 2FA 验证码仅用于本次会话换取 Cookie，任何情况下不持久化；登录流程不阻塞启动——用户取消、网络失败等均进入 REPL（可稍后 `login` 或手动粘贴 Cookie）。
 
 ### FR-2 资产列表
 
@@ -64,7 +74,7 @@ Web 终端能力在线、审计链路完整，但浏览器终端缺少本地终�
 - `next` / `n`、`prev` / `p`：翻页（越界自动回卷）；
 - `/关键字`：本地过滤（按主机名/IP 模糊匹配，**大小写不敏感**），输入 `/` 清除；
 - `reload` / `r`：强制重新拉取资产；
-- 会话无效（401/302/404）时给出明确错误提示，引导检查 Cookie。
+- 会话无效（401/302/403）时自动触发重新登录；非失效错误给出明确提示，引导检查 Cookie。
 
 ### FR-3 终端连接
 
@@ -81,8 +91,8 @@ Web 终端能力在线、审计链路完整，但浏览器终端缺少本地终�
 | 维度 | 要求 |
 | --- | --- |
 | 性能 | 数据通路低延迟透传（裸字节直发，无编解码开销）；终端输入延迟与浏览器 Web 终端同一量级（本地网络 <100ms 内回显） |
-| 可用性 | 单二进制无外部依赖；Cookie 失效时错误信息可操作（提示编辑 config.json） |
-| 安全 | Cookie 明文仅存本地 0600 配置；全程走 TLS（wss://）；不落盘任何终端会话内容 |
+| 可用性 | 单二进制无外部依赖；Cookie 失效时自动重新登录，错误信息可操作（区分账号密码错/验证码错/网络不可达） |
+| 安全 | Cookie 明文仅存本地 0600 配置；账号密码与 2FA 验证码不落盘不打印不写日志；全程走 TLS（wss://） |
 | 可维护性 | 模块按 `internal/{config, jumpserver, terminal, session, repl}` 分层，单测覆盖编解码、协议、配置与 REPL 交互 |
 | 兼容性 | 对标 JumpServer v3.x 部署（实测 `/core/auth/login/` 前缀佐证），协议差异项见附录 D 待验证清单 |
 
@@ -152,7 +162,8 @@ sequenceDiagram
 | --- | --- | --- |
 | 语言 | Go 1.22+ | 单二进制、标准库网络能力强、跨平台编译 |
 | WebSocket | github.com/gorilla/websocket | 与参考实现一致、社区最成熟、文档丰富 |
-| 终端 | golang.org/x/term | raw mode、尺寸读取、SIGWINCH 监听（Go 官方扩展库；本期不启动本地 shell，故不引入 creack/pty） |
+| 终端 | golang.org/x/term | raw mode、尺寸读取、SIGWINCH 监听、ReadPassword 隐藏回显（Go 官方扩展库；本期不启动本地 shell，故不引入 creack/pty） |
+| 登录加密 | 标准库 crypto/{rsa,aes,rand} | RSA PKCS1v1.5 + AES/ECB/ZeroPadding（与 JumpServer 前端 session-encrypt.js / 后端 common/utils/crypto.py 对齐，见附录 D V5）；不引入第三方加密库 |
 | 配置 | 标准库 encoding/json + os.UserHomeDir | 零依赖，`~/.config/reedferry/config.json`（XDG 风格，跨平台统一） |
 | 日志 | 标准库 log | 调试信息输出到 stderr，不污染终端数据流 |
 
@@ -177,12 +188,14 @@ sequenceDiagram
 reedferry/
 ├── cmd/reedferry/main.go        # 入口：无参数进入 REPL（带参数提示错误）
 ├── internal/
-│   ├── repl/                    # 交互式 REPL：命令解析、分页/过滤、连接编排
-│   │   ├── repl.go              # 主循环、命令分发、输入模型、连接编排
+│   ├── repl/                    # 交互式 REPL：命令解析、分页/过滤、连接编排、登录编排
+│   │   ├── repl.go              # 主循环、命令分发、输入模型、连接编排、自动登录
 │   │   └── repl_test.go
 │   ├── config/                  # 配置读写（模板创建、0600 原子写）
-│   ├── jumpserver/              # API 客户端 + WebSocket 协议适配
+│   ├── authui/                  # 登录界面：账号/密码/2FA 验证码终端输入（隐藏回显）
+│   ├── jumpserver/              # API 客户端 + WebSocket 协议适配 + 登录流程
 │   │   ├── api.go               # REST：资产树、账号、建连 token
+│   │   ├── login.go             # 登录流程：RSA/AES 密码加密、2FA、Cookie 提取（见附录 D V5）
 │   │   ├── ws.go                # WebSocket 连接与消息收发
 │   │   └── protocol.go          # 消息类型常量、JSON 编解码
 │   ├── terminal/                # 终端管理（raw mode、尺寸、SIGWINCH resize 事件）
@@ -221,17 +234,42 @@ reedferry/
       participant F as config.json
       R->>F: EnsureConfig（不存在 → 写示例模板）
       F-->>R: 模板 {host: 占位, cookie: ""}
-      R->>R: Cookie 为空 → 提示编辑 <路径> 填入 Cookie
+      R->>R: Cookie 为空 → 引导交互式登录（或提示编辑 <路径> 填入 Cookie）
+      R->>J: 登录：GET 登录页 → POST 表单（RSA/AES 加密密码）→ 302 guard
+      J-->>R: （可选）2FA 挑战：输入动态验证码
+      R->>J: POST code + mfa_type
+      J-->>R: 会话 Cookie
+      R->>F: 登录成功 → 自动写入新 Cookie（0600 原子写）
       R->>F: 用户编辑 host/cookie 后 reload
   ```
 
-### 5.2.2 模块 B：jumpserver（API 客户端 + WebSocket 协议适配）
+### 5.2.2 模块 B：jumpserver（API 客户端 + WebSocket 协议适配 + 登录流程）
 
 * **功能描述**
 
-  封装与 JumpServer 的全部交互：REST 查询资产与可用账号、创建建连 token、建立 koko WebSocket 通道、消息编解码（Text JSON 控制帧 + Binary 裸字节）。
+  封装与 JumpServer 的全部交互：REST 查询资产与可用账号、创建建连 token、建立 koko WebSocket 通道、消息编解码（Text JSON 控制帧 + Binary 裸字节），以及程序内登录流程（交互式账号密码 + 可选 2FA，换取会话 Cookie）。登录实现细节与实探结论见附录 D V5。
 
 * **接口设计**
+
+  ```go
+  // 登录流程（纯 HTTP 客户端，无浏览器依赖；密码加密与前端 session-encrypt.js 对齐）
+  type LoginFlow struct{ ... }
+  func NewLoginFlow(ctx, host string) (*LoginFlow, error)   // 打开登录页：取 csrf、探测 RSA/国密方案
+  func (f *LoginFlow) SubmitCredentials(ctx, username, password string) (*LoginOutcome, error)
+      // POST /core/auth/login/（表单：csrfmiddlewaretoken/username/password/auto_login）
+      // 密码 = AES/ECB/ZeroPadding（随机 key）加密，key 用 RSA 公钥（PKCS1v1.5）加密，
+      // 输出 "{rsaKeyCipher}:{aesPasswordCipher}"（均 base64，与 session-encrypt.js 一致）
+      // 302 → guard 分流；200 → 账号密码错 / 图形验证码触发
+  func (f *LoginFlow) SubmitMFA(ctx, code, mfaType string) (*LoginOutcome, error)
+      // POST /core/auth/login/mfa/（表单：csrfmiddlewaretoken/code/mfa_type）
+      // 2FA 动态验证码校验；错 → LoginErrBadMFA
+  type LoginOutcome struct {
+      Cookie  string     // 登录完成后的会话 Cookie 串（写入配置文件）
+      NeedMFA bool       // 需要用户输入 2FA 动态验证码
+      Prompt  *MFAPrompt // NeedMFA 时的可用验证方式（type/label）
+  }
+  type LoginError struct{ Kind LoginErrorKind; Msg string } // 错误分类（账号密码错/验证码错/图形验证码/第三方登录/国密）
+  ```
 
   ```go
   // REST（带 Cookie 的 GET；路径为 JumpServer v3 实测结果，见附录 D V1/V2）
@@ -306,7 +344,7 @@ reedferry/
 
 * **边界与异常**
 
-  - API 非 200：按状态码给提示（401/302 会话失效 → 提示检查 Cookie 并编辑 config.json；404 → 见附录 D 排查）；
+  - API 非 200：按状态码给提示（401/302/403 会话失效 → REPL 层自动重新登录，见 5.2.5；404 → 见附录 D 排查）；
   - 资产不存在/无可用账号：明确报错退出；
   - WS 握手失败：区分网络不可达 / Cookie 无效（302 到登录页）；
   - 请求超时兜底：所有 API 请求带 15s 超时（context.WithTimeout + http.Client.Timeout 双层），body 读取在 cancel 前完成，杜绝挂起。
@@ -404,6 +442,7 @@ reedferry/
   | `<编号>` | 直接连接列表中的资产（过滤后列表的全局序号） |
   | `<主机名或IP>` | 直接输入名称精确匹配连接（未拉取时先自动拉取） |
   | `reload` / `r` | 强制重新拉取资产（编辑配置后生效） |
+  | `login` | 交互式重新登录（输入账号密码，可选 2FA，成功后自动更新会话 Cookie） |
   | `help` / `?` | 显示全部命令帮助 |
   | `exit` / `quit` / `Ctrl-D` | 退出（REPL 为正常行输入模式，Ctrl-D 行首 = EOF） |
 
@@ -416,34 +455,56 @@ reedferry/
   - 分发 goroutine 按当前模式转发：命令模式 → 命令 channel（REPL 消费）；会话模式 → 会话 channel（session 消费）；
   - 会话结束分发不再发会话 channel，泄漏的上行 goroutine 阻塞在 channel 接收而非 fd 读取，不再与 REPL 竞争。
 
-* **配置引导**
+* **配置引导与自动登录**
 
   - 启动 `EnsureConfig`：无配置则创建示例模板（占位 host + 空 cookie）并提示编辑路径；
-  - Cookie 为空：提示"请编辑 <路径> 填入 Cookie（F12 → Network → 复制 Cookie 请求头）"；
-  - `list` 在 Cookie 为空时提示先编辑配置；`reload` 强制重拉。
+  - Cookie 为空或已失效（401/302/403）：进入交互式登录——提示输入账号/密码（密码隐藏回显），系统要求 2FA 时输入 JumpServer 2FA 动态验证码，成功后把新 Cookie 写入配置（0600 原子写）；
+  - 登录流程不阻塞启动：用户取消（Ctrl-D）、网络失败、登录失败均打印提示后进入 REPL，可稍后 `login` 或手动粘贴 Cookie；
+  - `list` 在 Cookie 为空时提示先编辑配置或登录；`reload` 强制重拉；API 会话失效时自动重新登录并重试。
 
 * **接口设计**
 
   ```go
-  func Run() error                          // 启动 REPL（EnsureConfig → help → 命令循环）
+  func Run() error                          // 启动 REPL（EnsureConfig → 按需登录 → help → 命令循环）
   func (r *REPL) runCommand(line string) error // 命令分发；errQuit 表示退出
-  // 测试可注入：connect（默认调 session.Run）、分页/过滤为纯方法
+  func (r *REPL) loginIfNeeded() error      // 启动时 Cookie 为空/失效 → 交互式登录（不阻塞启动）
+  func (r *REPL) interactiveLogin() (bool, error) // 登录编排（账号/密码/2FA + 写配置 + 清资产缓存）
+  func (r *REPL) maybeRelogin(err error) bool // APIError(401/302/403) → 重新登录，成功返回 true
+  // 测试可注入：connect（默认调 session.Run）、login（默认真实登录流程）、分页/过滤为纯方法
+  ```
+
+### 5.2.6 模块 F：authui（登录界面）
+
+* **功能描述**
+
+  提供交互式登录的用户界面：账号/密码/2FA 验证码的终端输入与结果提示。密码与验证码输入隐藏回显（golang.org/x/term.ReadPassword），输入内容仅存于本次调用栈，不打印、不写日志、不落盘（见 7.1）。
+
+* **接口设计**
+
+  ```go
+  // internal/authui
+  func ReadCredentials(in io.Reader, out io.Writer) (username, password string, err error)
+      // 提示输入账号与密码（密码隐藏回显）；stdin 非 TTY 或 EOF(Ctrl-D) 返回错误由调用方按取消处理
+  func RunMFA(ctx context.Context, flow *jumpserver.LoginFlow, prompt *jumpserver.MFAPrompt, in io.Reader, out io.Writer) (*jumpserver.LoginOutcome, error)
+      // 提示"请输入 JumpServer 2FA 动态验证码（方式）"，验证码错误可重试（上限 3 次）
+  var ErrNotTTY = errors.New("登录需要交互式终端...")
   ```
 
 # 6. 系统集成设计
 
 ## 6.1 第三方接口集成
 
-### 6.1.1 JumpServer REST API（认证复用）
+### 6.1.1 JumpServer REST API（认证双通道）
 
 | 项 | 说明 |
 | --- | --- |
-| 认证方式 | 请求头 `Cookie: sessionid=...; jms_csrftoken=...`（浏览器登录会话），无任何登录/刷新逻辑；CSRF 头 `X-CSRFToken` 取 cookie 中的 `jms_csrftoken`（JumpServer 自定义 cookie 名，非 Django 默认 csrftoken） |
+| 认证方式 | 请求头 `Cookie: sessionid=...; jms_csrftoken=...`（程序内登录或浏览器会话两种来源），无令牌刷新逻辑；CSRF 头 `X-CSRFToken` 取 cookie 中的 `jms_csrftoken`（JumpServer 自定义 cookie 名，非 Django 默认 csrftoken） |
+| 登录流程 | 程序内交互式登录：GET 登录页（取 csrf + 加密公钥）→ POST 表单（RSA/AES 加密密码）→ 302 guard →（可选）2FA 页提交动态验证码 → 提取会话 Cookie；细节与实探结论见附录 D V5 |
 | 资产列表 | `GET {host}/api/v1/perms/users/self/nodes/children-with-assets/tree/`（无 key 返回根节点，带 `key={节点id}` 逐层展开，BFS 收集资产叶子；v3 实测） |
 | 系统用户 | `GET {host}/api/v1/perms/users/self/assets/{asset_id}/`（解析 `permed_accounts` 数组，账号 id/alias 作 token 的 account；v3 实测） |
 | 建连 token | `POST {host}/api/v1/authentication/connection-token/`（头带 `Cookie` + `X-CSRFToken` + `Referer`；体含 asset/account/protocol 等，返回 201 `{id, value}`；v3 实测，见附录 D V3） |
 | 重试机制 | 网络类错误最多重试 1 次（间隔 500ms）；4xx 不重试，直接归类错误 |
-| 失效判定 | HTTP 401 / 302→登录页 判定为会话失效，提示检查 Cookie（编辑 config.json 后 reload） |
+| 失效判定 | HTTP 401 / 302→登录页 / 403 判定为会话失效，提示重新登录（自动触发）或检查 Cookie（编辑 config.json 后 reload） |
 
 ### 6.1.2 koko WebSocket 通道
 
@@ -460,14 +521,15 @@ reedferry/
 
 ```
 repl     ──调用──> session（终端会话编排）
-repl     ──调用──> jumpserver（资产/账号查询）
-repl     ──调用──> config（EnsureConfig / Load）
+repl     ──调用──> jumpserver（资产/账号查询 + 登录流程 LoginFlow）
+repl     ──调用──> authui（登录输入：账号/密码/2FA 隐藏回显）
+repl     ──调用──> config（EnsureConfig / Load / Save）
 session  ──调用──> jumpserver（API + WS）
 session  ──调用──> terminal（终端：raw mode / 尺寸 / resize 事件）
 config   ──调用──> jumpserver（无——校验由 repl/session 完成，避免循环依赖）
 ```
 
-调用链单向、无环；所有网络 I/O 收敛在 `jumpserver` 包，所有终端 I/O 收敛在 `terminal` 包，`repl` 为交互编排层，`session` 为连接引擎层，均便于单测与 mock。
+调用链单向、无环；所有网络 I/O 收敛在 `jumpserver` 包，所有终端 I/O 收敛在 `terminal`/`authui` 包，`repl` 为交互编排层，`session` 为连接引擎层，均便于单测与 mock。
 
 ## 6.3 中间件集成
 
@@ -479,7 +541,8 @@ config   ──调用──> jumpserver（无——校验由 repl/session 完成
 
 | 项 | 方案 |
 | --- | --- |
-| 身份认证 | 完全复用浏览器会话 Cookie，程序内不存储任何口令，不实现登录/MFA 逻辑 |
+| 身份认证 | 会话 Cookie 两种来源：程序内交互式登录（账号密码 + 可选 2FA，登录页 RSA/AES 加密协议，见附录 D V5）或手动复制浏览器会话 Cookie；程序内不持久化任何口令 |
+| 凭据安全 | 账号密码与 2FA 验证码仅存于本次调用栈：输入隐藏回显（x/term.ReadPassword）、不打印、不写日志、不落盘，任何情况下不持久化；登录失败错误信息不含凭据 |
 | 传输加密 | 全程 TLS（wss:// 与 https://）；证书校验保持开启，如 JumpServer 使用自签证书导致 TLS 校验失败时，评估显式 `--insecure` 开关（默认关闭） |
 | 本地存储 | Cookie 写入 `~/.config/reedferry/config.json`，文件权限 0600；展示时脱敏（仅前后 8 字符） |
 | 审计 | 连接链路与浏览器 Web 终端完全一致（同 koko、同系统用户），JumpServer 侧审计记录天然生效，Reedferry 不做旁路 |
@@ -555,7 +618,7 @@ config   ──调用──> jumpserver（无——校验由 repl/session 完成
 
 ## 10.1 部署流程
 
-单二进制交付：`go build -o ~/reedferry/reedferry ./cmd/reedferry`。首次运行自动创建示例配置模板，编辑 `~/.config/reedferry/config.json` 填入 host 与 Cookie（浏览器登录后 F12 → Network → 复制 Cookie 请求头）后重启或 reload。更新：重新 build 覆盖二进制即可，配置保留。
+单二进制交付：`go build -o ~/reedferry/reedferry ./cmd/reedferry`。首次运行自动创建示例配置模板，编辑 `~/.config/reedferry/config.json` 填入 host 后重启，程序内交互式登录（输入账号密码，可选 2FA）自动写入 Cookie；也可手动粘贴浏览器 Cookie（原有方式，浏览器登录后 F12 → Network → 复制 Cookie 请求头）。更新：重新 build 覆盖二进制即可，配置保留。
 
 ## 10.2 监控与告警
 
@@ -565,13 +628,17 @@ config   ──调用──> jumpserver（无——校验由 repl/session 完成
 
 | 故障 | 处置 |
 | --- | --- |
-| Cookie 过期（401/302） | 重新复制 Cookie 请求头，编辑 `~/.config/reedferry/config.json` 后 `reload` |
+| Cookie 过期（401/302/403） | 程序自动重新登录；也可 REPL 内 `login` 或编辑配置文件重新粘贴 Cookie 后 `reload` |
+| 登录失败（账号密码错） | 提示后重新输入（最多 3 次）；连续失败可稍后重试（JumpServer 有失败计数锁定） |
+| 2FA 验证码错 | 提示重新输入（最多 3 次） |
+| 网络不可达 | 检查 host 地址与网络；进入 REPL 后由 list 报错提示 |
+| 扫码/第三方登录环境 | 程序内无法完成，改用浏览器登录后复制 Cookie（见附录 D V5） |
 | API 404 | 按附录 D 待验证项排查流程处理 |
 | WS 断连 | 重新输入编号/主机名连接；网络抖动则稍后重试 |
 
 # 11. 用户培训与对接
 
-单用户工具，README 提供 30 秒上手说明：运行 `reedferry` → 首次编辑 config.json 填入 Cookie → `list` → 输入编号连接。对接方为 JumpServer 部署管理员：需确认 443 WebSocket 通道与权限策略保持可用（浏览器 Web 终端可用即可）。
+单用户工具，README 提供 30 秒上手说明：运行 `reedferry` → 编辑 config.json 填入 host → 程序内交互式登录（或手动粘贴 Cookie）→ `list` → 输入编号连接。对接方为 JumpServer 部署管理员：需确认 443 WebSocket 通道与权限策略保持可用（浏览器 Web 终端可用即可）。
 
 # 12. 附录
 
@@ -598,6 +665,7 @@ config   ──调用──> jumpserver（无——校验由 repl/session 完成
 | --- | --- | --- | --- |
 | 2026-08-13 | 需求澄清 | 设计助手（AI Agent）、用户 | 交互式 REPL 定位与 Non-Goals 拍板（结论已落入正文各章节） |
 | 2026-08-13 | 协议实测 | 用户、设计助手（AI Agent） | 资产树/账号/建连 token 端点与纯透传协议实测确认，结论见附录 D V1-V3 |
+| 2026-09-04 | 登录流程实测 | 开发（AI Agent） | 登录页/表单/302 链/MFA 页结构实测确认，结论见附录 D V5（含国密与第三方登录的未支持结论） |
 
 ## 附录 D：待验证项清单（重点）
 
@@ -670,3 +738,24 @@ config   ──调用──> jumpserver（无——校验由 repl/session 完成
 ### V4：PING 心跳间隔（低优先）
 
 参考实现中 25s ticker 被注释未启用。本期默认 30s 应用层 PING；若实测发现 nginx 空闲断连时间更短（表现为静默 30s 内被断），调整为更低间隔。
+
+### V5：登录流程（实测结论）
+
+**结论（jumpserver.xkw.com，JumpServer v3.x 实探）**：程序内登录可通过纯 HTTP 完成，含 2FA（TOTP）挑战。
+
+1. **GET `/core/auth/login/`** 返回 200 HTML，响应种下 `jms_csrftoken` / `jms_public_key` / `jms_sessionid`（匿名会话）/ `SESSION_COOKIE_NAME_PREFIX=jms_` / `acw_tc` 等 Cookie；页面含 `csrfmiddlewaretoken` 隐藏字段。密码加密公钥在 Cookie `jms_public_key`（base64(PEM PUBLIC KEY)）；实测该环境**不种** `jms_gm_ssl`（非国密），若某环境种 `jms_gm_ssl=1` 则为 SM2/SM4 国密方案——当前版本不支持，登录时报错并提示改用浏览器复制 Cookie。
+2. **POST `/core/auth/login/`**（`application/x-www-form-urlencoded`，带当前 csrfmiddlewaretoken）：字段 `csrfmiddlewaretoken` / `username` / `password` / `auto_login`。密码按前端 session-encrypt.js 逻辑加密：随机 AES key（前端 `(Math.random()+1).toString(36).substring(2)` 形态）→ AES/ECB/ZeroPadding 加密密码（key 补零到 16 字节，不足 16 倍数补零、整倍数不补块）；AES key 用 RSA 公钥（PKCS1 v1.5）加密 → 输出 `{rsaKeyCipher}:{aesPasswordCipher}`（均标准 base64）。实测正确提交后 **302 → `/core/auth/login/guard/?_=ok`**（状态码 302）；错误密码 200 重渲染登录页，错误文案在 `<p class="help-block red-fonts">`，连续失败后登录页出现图形验证码（字段 `captcha_0`（hidden key）+ `captcha_1`，另有 `challenge` 形态），程序内无法自动识别。
+3. **GET `/core/auth/login/guard/`**（302 链中间站）：需要 2FA 时 302 → `/core/auth/login/mfa/`；否则 302 → 业务首页 `/`（登录完成）。guard 302 回 `/core/auth/login/?_=session_empty` 表示会话未建立（登录实际失败）。
+4. **GET `/core/auth/login/mfa/`** 返回 200，页面含 csrfmiddlewaretoken、`<select name="mfa_type">`（选项为可用 MFA 方式，`disabled` 项不可用）与动态验证码输入框；2FA 方式实测支持 TOTP（`otp`），其余如 SMS 依赖短信网关配置。
+5. **POST `/core/auth/login/mfa/`**（表单 `csrfmiddlewaretoken` / `code` / `mfa_type`，mfa_type 取 select 选项值）：正确 → 302 → guard → 业务首页；错误 → 200 重渲染 MFA 页（错误文案可提取）。
+6. 302 链到业务首页（非 mfa/guard/第三方路径）即登录完成：用 Cookie Jar 收集服务端种下的全部会话 Cookie（`jms_sessionid` 等），序列化为 `k=v; k2=v2` 写入配置文件（0600 原子写）。登录完成后的 Cookie 可直接用于现有 API/WS 流程（含 `jms_csrftoken`）。
+
+**已确认的未支持场景（不硬编码臆测接口，报错提示替代路径）**：
+
+- **国密环境**（`jms_gm_ssl=1`）：需 SM2/SM4 加密，当前不实现，报错提示改用浏览器复制 Cookie；
+- **扫码/第三方登录**（302 → `/core/auth/wecom|dingtalk|feishu|lark|slack/*/qr/login/`、OpenID/CAS/SAML2/OAuth2）：无法纯 HTTP 完成，报错提示改用浏览器复制 Cookie；
+- **图形验证码**（登录页出现 `captcha_0`/`challenge` 字段）：程序内无法自动识别，报错提示稍后重试或改用浏览器复制 Cookie。
+
+**代码落点**：`internal/jumpserver/login.go`（LoginFlow：加密、302 链、MFA、Cookie 提取）+ `internal/authui/authui.go`（隐藏回显输入）+ `internal/repl/repl.go`（登录编排：Cookie 为空/失效自动触发、`login` 命令、失败分类提示）。
+
+**MFA 纯 HTTP 可行性结论**：本环境（TOTP 方式）可纯 HTTP 完成（提交 code+mfa_type 表单）；若某环境仅开放扫码类 MFA（如强制微信/企业微信扫码），则无法纯 HTTP 完成——程序已按 302 目标路径检测并给出替代路径提示，不臆测接口。
