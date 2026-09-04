@@ -1,3 +1,4 @@
 .worktrees/
 /reedferry
 *.test
+.DS_Store
