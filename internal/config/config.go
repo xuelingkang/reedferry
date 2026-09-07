@@ -1,7 +1,8 @@
 // Package config 管理 ~/.config/reedferry/config.json 的读写（XDG 风格，跨平台统一）。
 //
-// 配置仅含 JumpServer 地址与浏览器会话 Cookie，文件权限 0600，
-// 采用先写临时文件再 rename 的原子写，避免写入中断留下半截文件。
+// 配置含 JumpServer 地址、会话 Cookie，以及可选的登录账号/密码（用户明确选择
+// 存配置时启用），文件权限 0600，采用先写临时文件再 rename 的原子写，避免写入
+// 中断留下半截文件。含登录凭据，勿提交版本库。
 package config
 
 import (
@@ -20,9 +21,14 @@ var ErrNotConfigured = errors.New("reedferry: 未配置，请先运行 `reedferr
 const ExampleHost = "https://your-jumpserver.example.com"
 
 // Config 是本地配置文件结构。
+//
+// Username/Password 为可选的登录凭据（用户明确选择存配置）：配置后交互式登录
+// 跳过对应输入，直接使用；2FA 动态验证码任何情况下不落盘、不写入配置。
 type Config struct {
-	Host   string `json:"host"`   // JumpServer 地址，如 https://your-jumpserver.example.com
-	Cookie string `json:"cookie"` // 浏览器会话 Cookie，如 "sessionid=xxx; csrftoken=yyy"
+	Host     string `json:"host"`               // JumpServer 地址，如 https://your-jumpserver.example.com
+	Cookie   string `json:"cookie"`             // 浏览器会话 Cookie，如 "sessionid=xxx; jms_csrftoken=yyy"
+	Username string `json:"username,omitempty"` // 可选：登录账号；配置则登录时跳过账号输入
+	Password string `json:"password,omitempty"` // 可选：登录密码（明文存储，0600 权限）；配置则登录时跳过密码输入
 }
 
 // pathOverride 仅用于测试重定向配置文件位置；为空时使用默认路径。

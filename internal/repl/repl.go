@@ -39,10 +39,13 @@ type REPL struct {
 	pageSize int
 
 	// 输入通道：唯一 stdin 读取 goroutine 按模式分发（命令模式 → cmdCh；
-	// 会话模式 → sessCh），避免会话结束后泄漏的上行 goroutine 与 REPL 竞争抢读。
-	cmdCh  chan []byte
-	sessMu sync.Mutex
-	sessCh chan []byte // 非 nil 表示当前处于终端会话
+	// 会话模式 → sessCh；登录模式 → loginCh），避免会话结束后泄漏的上行
+	// goroutine 与 REPL 竞争抢读。
+	cmdCh   chan []byte
+	sessMu  sync.Mutex
+	sessCh  chan []byte // 非 nil 表示当前处于终端会话
+	loginMu sync.Mutex
+	loginCh chan []byte // 非 nil 表示当前处于交互式登录（登录输入分发目标）
 
 	// connect 连接指定资产；默认调用 session.Run，测试可注入 mock。
 	connect func(a jumpserver.Asset) error
@@ -59,6 +62,10 @@ func Run() error {
 	if err := r.loadConfig(); err != nil {
 		return err
 	}
+	// 先启动 stdin 分发（唯一读取 goroutine + 模式分发）：启动时的按需登录
+	// （loginIfNeeded）与 REPL 内 login 命令均经登录分发通道输入，与会话模式
+	// 同语义，避免登录输入与命令循环竞争抢读。
+	r.startInput()
 	if err := r.loginIfNeeded(); err != nil {
 		return err
 	}
@@ -115,6 +122,12 @@ func (r *REPL) loginIfNeeded() error {
 // interactiveLogin 执行一次交互式登录（账号/密码/2FA 隐藏回显输入），
 // 成功后把新 Cookie 写入配置并清空资产缓存（下次 list 重新拉取）。
 // 返回 ok=false 表示用户主动取消登录。测试可注入 r.login 替代网络流程。
+//
+// 输入经登录分发通道（loginCh）读取，与会话模式同语义：唯一 stdin 读取
+// goroutine 按当前模式投递字节，登录输入不与命令循环/会话模式竞争抢读。
+// 配置了 username/password 时首次提交直接使用配置凭据（跳过对应交互输入）；
+// 配置凭据登录失败（账号密码错/触发图形验证码）时回退为交互式输入重试。
+// 2FA 动态验证码任何情况下都交互输入（隐藏回显，不落盘）。
 func (r *REPL) interactiveLogin() (ok bool, err error) {
 	if r.login != nil {
 		ok, err = r.login()
@@ -122,13 +135,33 @@ func (r *REPL) interactiveLogin() (ok bool, err error) {
 			return ok, err
 		}
 		// 登录 hook 已更新 r.cfg.Cookie：统一在此持久化（沿用 0600 原子写）
-		if err := r.persistLogin(); err != nil {
+		if err := r.persistLogin(false); err != nil {
 			return false, err
 		}
 		return true, nil
 	}
+	// 登录模式：登录分发通道（唯一 stdin 读取 goroutine 此时按登录模式投递）
+	loginCh := make(chan []byte, 64)
+	r.loginMu.Lock()
+	r.loginCh = loginCh
+	r.loginMu.Unlock()
+	defer func() {
+		r.loginMu.Lock()
+		if r.loginCh == loginCh {
+			r.loginCh = nil
+		}
+		r.loginMu.Unlock()
+	}()
+	hr := authui.NewHiddenReader(loginCh, int(os.Stdin.Fd()))
+	// 预填凭据：来自配置 username/password（可选）；2FA 动态验证码不预填
+	preset := authui.Credentials{Username: r.cfg.Username, Password: r.cfg.Password}
 	for attempt := 0; ; attempt++ {
-		username, password, err := authui.ReadCredentials(os.Stdin, os.Stdout)
+		// 配置凭据仅首次提交直接使用；登录失败后回退交互输入重试
+		usedPreset := attempt == 0 && preset.Username != "" && preset.Password != ""
+		if attempt > 0 {
+			preset = authui.Credentials{}
+		}
+		username, password, err := authui.ReadCredentials(hr, os.Stdout, preset)
 		if err != nil {
 			if errors.Is(err, authui.ErrNotTTY) || errors.Is(err, io.EOF) {
 				fmt.Fprintln(os.Stderr, "已取消登录；可编辑配置文件填入 Cookie 后输入 reload 生效")
@@ -161,7 +194,7 @@ func (r *REPL) interactiveLogin() (ok bool, err error) {
 		}
 		// 2FA 挑战：循环直至登录完成（RunMFA 内部处理验证码错误重试）
 		for outcome.NeedMFA {
-			outcome, err = authui.RunMFA(context.Background(), flow, outcome.Prompt, os.Stdin, os.Stdout)
+			outcome, err = authui.RunMFA(context.Background(), flow, outcome.Prompt, hr, os.Stdout)
 			if err != nil {
 				if errors.Is(err, authui.ErrNotTTY) || errors.Is(err, io.EOF) {
 					fmt.Fprintln(os.Stderr, "已取消登录")
@@ -172,7 +205,7 @@ func (r *REPL) interactiveLogin() (ok bool, err error) {
 		}
 		// 登录完成：写入配置（沿用 0600 原子写，见 config.Save）
 		r.cfg.Cookie = outcome.Cookie
-		if err := r.persistLogin(); err != nil {
+		if err := r.persistLogin(usedPreset); err != nil {
 			return false, err
 		}
 		return true, nil
@@ -180,12 +213,17 @@ func (r *REPL) interactiveLogin() (ok bool, err error) {
 }
 
 // persistLogin 把已更新的会话 Cookie 写入配置并清空资产缓存。
-func (r *REPL) persistLogin() error {
+// usedPreset 表示本次登录是否直接使用配置中的账号密码（仅影响提示文案）。
+func (r *REPL) persistLogin(usedPreset bool) error {
 	if err := config.Save(r.cfg); err != nil {
 		return fmt.Errorf("登录成功但写入配置失败：%w", err)
 	}
 	r.assets = nil // 新会话：清空资产缓存，下次 list 重新拉取
-	fmt.Fprintln(os.Stdout, "登录成功，会话 Cookie 已写入配置文件（本次输入的账号密码不会保存）")
+	if usedPreset {
+		fmt.Fprintln(os.Stdout, "登录成功，会话 Cookie 已写入配置文件（账号密码沿用配置；2FA 动态验证码未保存）")
+	} else {
+		fmt.Fprintln(os.Stdout, "登录成功，会话 Cookie 已写入配置文件（本次输入的账号密码不会保存）")
+	}
 	return nil
 }
 
@@ -298,13 +336,16 @@ func (r *chanReader) Read(p []byte) (int, error) {
 	return n, nil
 }
 
-// loop 命令主循环（正常行输入模式；Ctrl-D 行首 = EOF 退出）。
+// startInput 启动唯一的 stdin 读取 goroutine 与模式分发 goroutine（在 Run 中
+// 于按需登录之前启动，保证启动登录与 REPL 内 login 命令均经分发通道输入）。
 //
-// 输入模型（修复回 REPL 后首次输入被吞的 bug）：唯一 stdin 读取 goroutine 把
-// 字节投递到 rawCh；分发 goroutine 按当前模式转发——命令模式发 cmdCh（REPL
-// 消费），会话模式发 sessCh（session 消费）。会话结束后分发不再发 sessCh，
-// 泄漏的上行 goroutine 阻塞在 channel 接收而非 fd 读取，不再与 REPL 竞争 stdin。
-func (r *REPL) loop() error {
+// 输入模型（修复回 REPL 后首次输入被吞、登录输入无响应的 bug）：唯一 stdin
+// 读取 goroutine 把字节投递到 rawCh；分发 goroutine 按当前模式转发——登录
+// 模式发 loginCh（authui 登录输入消费），会话模式发 sessCh（session 消费），
+// 否则发 cmdCh（REPL 命令循环消费）。登录/会话结束后分发不再发对应通道，
+// 泄漏的输入读取 goroutine 阻塞在 channel 接收而非 fd 读取，不再与 REPL
+// 竞争 stdin。
+func (r *REPL) startInput() {
 	rawCh := make(chan []byte, 64)
 	r.cmdCh = make(chan []byte, 64)
 
@@ -323,20 +364,38 @@ func (r *REPL) loop() error {
 			}
 		}
 	}()
-	go func() { // 模式分发
+	go func() { // 模式分发：登录模式 > 会话模式 > 命令模式
 		for data := range rawCh {
+			r.loginMu.Lock()
+			lch := r.loginCh
+			r.loginMu.Unlock()
 			r.sessMu.Lock()
 			ch := r.sessCh
 			r.sessMu.Unlock()
-			if ch != nil {
+			switch {
+			case lch != nil:
+				lch <- data
+			case ch != nil:
 				ch <- data
-			} else {
+			default:
 				r.cmdCh <- data
 			}
 		}
+		// stdin EOF（Ctrl-D）：关闭登录通道让登录按取消处理；关闭命令通道让
+		// 命令循环按退出处理。会话通道由 session 自行收敛，不在此关闭。
+		r.loginMu.Lock()
+		if r.loginCh != nil {
+			close(r.loginCh)
+			r.loginCh = nil
+		}
+		r.loginMu.Unlock()
 		close(r.cmdCh)
 	}()
+}
 
+// loop 命令主循环（正常行输入模式；Ctrl-D 行首 = EOF 退出）。
+// stdin 读取与模式分发已由 startInput 启动，此处仅消费命令通道。
+func (r *REPL) loop() error {
 	reader := bufio.NewReader(&chanReader{ch: r.cmdCh})
 	for {
 		fmt.Print("reedferry> ")
