@@ -476,3 +476,34 @@ func TestLoginNetworkError(t *testing.T) {
 		t.Fatal("want network error, got nil")
 	}
 }
+
+// 调试输出脱敏：票据/令牌类查询参数不得原样打印。
+func TestSafeURLRedactsSecrets(t *testing.T) {
+	u, err := url.Parse("https://jumpserver.xkw.com/core/auth/cas/login/?ticket=ST-123-secret&token=tok&key=k&next=%2F")
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := safeURL(u)
+	for _, secret := range []string{"ST-123-secret", "token=tok", "key=k"} {
+		if strings.Contains(got, secret) {
+			t.Errorf("secret leaked in trace: %s", got)
+		}
+	}
+	if !strings.Contains(got, "next=%2F") {
+		t.Errorf("harmless param dropped: %s", got)
+	}
+}
+
+// cookieNames 只返回字段名，不含值。
+func TestCookieNames(t *testing.T) {
+	got := cookieNames("jms_sessionid=secret-value; jms_csrftoken=tok")
+	if strings.Contains(got, "secret-value") || strings.Contains(got, "=tok") {
+		t.Errorf("values leaked: %s", got)
+	}
+	if got != "jms_sessionid, jms_csrftoken" {
+		t.Errorf("cookieNames: %q", got)
+	}
+	if got := cookieNames(""); got != "（空）" {
+		t.Errorf("empty: %q", got)
+	}
+}

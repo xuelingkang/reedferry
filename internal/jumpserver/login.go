@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"net/http/cookiejar"
 	"net/url"
+	"os"
 	"regexp"
 	"strings"
 )
@@ -38,6 +39,10 @@ const (
 	ssoDoLoginPath   = "/user/wechat-applet/dologin"
 	ssoActivatePath  = "/user/set-activate-flag"
 )
+
+// loginDebug 打开后把登录链路的每一跳（方法、脱敏 URL、状态码、跳转目标、
+// 下发的 Cookie 名）打印到 stderr，用于排查 SSO 侧改版；默认关闭。
+var loginDebug = os.Getenv("REEDFERRY_LOGIN_DEBUG") != ""
 
 // LoginErrorKind 登录失败分类，CLI 层据此给出针对性提示。
 type LoginErrorKind int
@@ -468,7 +473,7 @@ func (f *LoginFlow) SubmitMFA(ctx context.Context, code, mfaType string) (*Login
 func (f *LoginFlow) done() (*LoginOutcome, error) {
 	biz := f.serializeCookies(f.host)
 	if !strings.Contains(biz, "jms_sessionid=") {
-		return nil, errors.New("登录后未拿到业务会话 Cookie（jms_sessionid），请重试或改用浏览器登录后复制 Cookie")
+		return nil, fmt.Errorf("登录后未拿到业务会话 Cookie（jms_sessionid），实际字段：%s", cookieNames(biz))
 	}
 	return &LoginOutcome{Cookie: biz, SSOCookie: f.serializeCookies(f.ssoBase)}, nil
 }
@@ -490,6 +495,7 @@ func (f *LoginFlow) get(ctx context.Context, u string) ([]byte, *http.Response, 
 	if err != nil {
 		return nil, nil, err
 	}
+	trace(http.MethodGet, req.URL, resp)
 	return raw, resp, nil
 }
 
@@ -512,7 +518,40 @@ func (f *LoginFlow) postForm(ctx context.Context, u string, form url.Values, ref
 	if err != nil {
 		return nil, nil, err
 	}
+	trace(http.MethodPost, req.URL, resp)
 	return raw, resp, nil
+}
+
+// trace 打印一次 HTTP 跳转摘要（URL 中票据/令牌类参数值脱敏）。
+func trace(method string, u *url.URL, resp *http.Response) {
+	if !loginDebug || resp == nil {
+		return
+	}
+	fmt.Fprintf(os.Stderr, "[login] %s %s -> %d", method, safeURL(u), resp.StatusCode)
+	if loc := resp.Header.Get("Location"); loc != "" {
+		fmt.Fprintf(os.Stderr, " location=%s", loc)
+	}
+	fmt.Fprintln(os.Stderr)
+	for _, c := range resp.Cookies() {
+		fmt.Fprintf(os.Stderr, "[login]   set-cookie %s len=%d path=%s domain=%s\n", c.Name, len(c.Value), c.Path, c.Domain)
+	}
+}
+
+// safeURL 输出不含凭据的 URL：查询参数值对 ticket/token/key/code 类脱敏。
+func safeURL(u *url.URL) string {
+	if u == nil {
+		return ""
+	}
+	q := u.Query()
+	for k := range q {
+		switch strings.ToLower(k) {
+		case "ticket", "token", "key", "code", "execution":
+			q.Set(k, "<redacted>")
+		}
+	}
+	out := *u
+	out.RawQuery = q.Encode()
+	return out.String()
 }
 
 // redirectTarget 请求 u 并返回其 302 目标（绝对 URL）；非 302 视为异常。
@@ -567,6 +606,21 @@ func (f *LoginFlow) serializeCookies(base string) string {
 		parts = append(parts, c.Name+"="+c.Value)
 	}
 	return strings.Join(parts, "; ")
+}
+
+// cookieNames 返回 Cookie 串中的字段名（不含值），用于诊断。
+func cookieNames(raw string) string {
+	names := make([]string, 0, 8)
+	for _, part := range strings.Split(raw, ";") {
+		k, _, ok := strings.Cut(strings.TrimSpace(part), "=")
+		if ok && k != "" {
+			names = append(names, k)
+		}
+	}
+	if len(names) == 0 {
+		return "（空）"
+	}
+	return strings.Join(names, ", ")
 }
 
 // ---------- 页面解析（正则容错，页面结构见设计文档附录 D V5） ----------
