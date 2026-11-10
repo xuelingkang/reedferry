@@ -410,12 +410,7 @@ func (f *LoginFlow) completeScan(ctx context.Context) (*LoginOutcome, error) {
 		return nil, fmt.Errorf("提交扫码结果失败（网络不可达或服务异常）：%w", err)
 	}
 	if resp.StatusCode >= 300 && resp.StatusCode < 400 {
-		location := f.resolve(resp.Header.Get("Location"))
-		if strings.Contains(location, "ticket=") {
-			return f.acceptTicket(ctx, location)
-		}
-		// 302 但不带 ticket：多为 CAS 把流程推到下一步（协议/组织/再次登录）
-		return nil, fmt.Errorf("提交扫码结果后跳转到 %s，未携带 ticket（可能需要额外确认步骤）", location)
+		return f.followToService(ctx, f.resolveFrom(f.loginURL, resp.Header.Get("Location")))
 	}
 	dumpFailure("cas-post", raw)
 
@@ -449,6 +444,68 @@ func (f *LoginFlow) exchangeViaGet(ctx context.Context) (*LoginOutcome, bool, er
 	default:
 		return nil, false, fmt.Errorf("请求统一认证登录页失败：HTTP %d", resp.StatusCode)
 	}
+}
+
+// followToService 沿换票跳转链走到业务回调：CAS 常把票据编码进
+// serviceUrl 参数（中间还夹一个 sso.xkw.com 的路由网关），因此不能只看
+// Location 里有没有明文 ticket=。最多跟随 6 跳。
+func (f *LoginFlow) followToService(ctx context.Context, location string) (*LoginOutcome, error) {
+	for i := 0; i < 6; i++ {
+		if target, ok := ticketTarget(location); ok {
+			return f.acceptTicket(ctx, target)
+		}
+		raw, resp, err := f.get(ctx, location)
+		if err != nil {
+			return nil, fmt.Errorf("跟随换票跳转失败（网络不可达或服务异常）：%w", err)
+		}
+		if resp.StatusCode >= 300 && resp.StatusCode < 400 {
+			next := f.resolveFrom(location, resp.Header.Get("Location"))
+			if next == "" || next == location {
+				return nil, fmt.Errorf("换票跳转链自指（%s）", location)
+			}
+			location = next
+			continue
+		}
+		// 中间页可能用 JS/meta 跳转
+		if target := extractRedirectTarget(string(raw)); target != "" {
+			location = f.resolveFrom(location, target)
+			continue
+		}
+		return nil, fmt.Errorf("换票流程停在 %s（HTTP %d），未拿到票据", location, resp.StatusCode)
+	}
+	return nil, errors.New("换票跳转链过长（超过 6 跳），请重试")
+}
+
+// ticketTarget 判断一个 URL 本身或其 serviceUrl 参数里是否带 ticket，
+// 返回应回跳的实际地址。
+func ticketTarget(location string) (string, bool) {
+	u, err := url.Parse(location)
+	if err != nil {
+		return "", false
+	}
+	if strings.Contains(u.RawQuery, "ticket=") || strings.Contains(u.Fragment, "ticket=") {
+		return location, true
+	}
+	if su := u.Query().Get("serviceUrl"); su != "" && strings.Contains(su, "ticket=") {
+		return su, true
+	}
+	return "", false
+}
+
+// resolveFrom 以 base 为基准解析（可能相对的）跳转目标。
+func (f *LoginFlow) resolveFrom(base, location string) string {
+	if location == "" {
+		return ""
+	}
+	u, err := url.Parse(location)
+	if err != nil || u.IsAbs() {
+		return location
+	}
+	b, err := url.Parse(base)
+	if err != nil {
+		return location
+	}
+	return b.ResolveReference(u).String()
 }
 
 // acceptTicket 带票据回跳业务侧，服务端校验后种会话 Cookie，再按业务侧
@@ -724,14 +781,16 @@ func cookieNames(raw string) string {
 // ---------- 页面解析（正则容错，页面结构见设计文档附录 D V5） ----------
 
 var (
-	qrTokenRe    = regexp.MustCompile(`var\s+qrToken\s*=\s*"([^"]+)"`)
-	hiddenRe     = regexp.MustCompile(`(?is)<input[^>]*type="hidden"[^>]*>`)
-	nameAttrRe   = regexp.MustCompile(`(?is)name="([^"]*)"`)
-	valAttrRe    = regexp.MustCompile(`(?is)value="([^"]*)"`)
-	mfaOptionRe  = regexp.MustCompile(`(?s)<option\s+value="([^"]+)"([^>]*)>(.*?)</option>`)
-	errorBlockRe = regexp.MustCompile(`(?s)<p[^>]*class="[^"]*(?:red-fonts|error)[^"]*"[^>]*>(.*?)</p>`)
-	tagRe        = regexp.MustCompile(`<[^>]*>`)
-	titleRe      = regexp.MustCompile(`(?is)<title[^>]*>(.*?)</title>`)
+	qrTokenRe     = regexp.MustCompile(`var\s+qrToken\s*=\s*"([^"]+)"`)
+	hiddenRe      = regexp.MustCompile(`(?is)<input[^>]*type="hidden"[^>]*>`)
+	nameAttrRe    = regexp.MustCompile(`(?is)name="([^"]*)"`)
+	valAttrRe     = regexp.MustCompile(`(?is)value="([^"]*)"`)
+	mfaOptionRe   = regexp.MustCompile(`(?s)<option\s+value="([^"]+)"([^>]*)>(.*?)</option>`)
+	errorBlockRe  = regexp.MustCompile(`(?s)<p[^>]*class="[^"]*(?:red-fonts|error)[^"]*"[^>]*>(.*?)</p>`)
+	tagRe         = regexp.MustCompile(`<[^>]*>`)
+	titleRe       = regexp.MustCompile(`(?is)<title[^>]*>(.*?)</title>`)
+	metaRefreshRe = regexp.MustCompile(`(?is)<meta[^>]*http-equiv=["']?refresh["']?[^>]*content=["']?\s*\d*\s*;\s*url=([^"'\s>]+)`)
+	jsLocationRe  = regexp.MustCompile(`(?is)location(?:\.href)?\s*=\s*["']([^"']+)["']`)
 )
 
 // extractQRToken 提取 SSO 登录页内联脚本中的扫码令牌。
@@ -839,6 +898,17 @@ func failureSummary(raw []byte) string {
 		summary = "响应中未找到错误文案"
 	}
 	return strings.TrimSpace(summary)
+}
+
+// extractRedirectTarget 从中间页提取跳转目标（meta refresh 或 location.href）。
+func extractRedirectTarget(html string) string {
+	if m := metaRefreshRe.FindStringSubmatch(html); len(m) == 2 && m[1] != "" {
+		return strings.TrimSpace(m[1])
+	}
+	if m := jsLocationRe.FindStringSubmatch(html); len(m) == 2 && m[1] != "" {
+		return strings.TrimSpace(m[1])
+	}
+	return ""
 }
 
 // pageError 从重渲染页面提取错误文案（无则返回空串）。

@@ -156,7 +156,16 @@ func newFakeSSO(t *testing.T, business string) *fakeSSO {
 			_, _ = w.Write([]byte(ssoPage))
 			return
 		}
-		http.Redirect(w, r, f.business+"/core/auth/cas/login/?ticket="+f.ticket, http.StatusFound)
+		serviceURL := f.business + "/core/auth/cas/login/?ticket=" + f.ticket
+		http.Redirect(w, r, f.server.URL+"/user/service-route?routeTicket=rt-1&serviceUrl="+url.QueryEscape(serviceURL), http.StatusFound)
+	})
+	mux.HandleFunc("/user/service-route", func(w http.ResponseWriter, r *http.Request) {
+		target := r.URL.Query().Get("serviceUrl")
+		if target == "" {
+			w.WriteHeader(http.StatusBadRequest)
+			return
+		}
+		http.Redirect(w, r, target, http.StatusFound)
 	})
 	mux.HandleFunc("/user/qrcode/qrcode-login/v2/content", func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Query().Get("service") == "" {
@@ -480,6 +489,26 @@ func TestLoginFallbackToGet(t *testing.T) {
 	sso.mu.Unlock()
 	if posts == 0 {
 		t.Error("expected form post to be attempted first")
+	}
+}
+
+// 票据被编码进 serviceUrl（经 sso.xkw.com 路由网关）时同样要识别出来。
+func TestTicketTargetFromServiceURL(t *testing.T) {
+	loc := "https://sso.xkw.com/user/service-route?routeTicket=rt&serviceUrl=" +
+		url.QueryEscape("https://jumpserver.xkw.com/core/auth/cas/login/?ticket=ST-138557-abc")
+	target, ok := ticketTarget(loc)
+	if !ok {
+		t.Fatalf("serviceUrl ticket not detected: %s", loc)
+	}
+	if !strings.Contains(target, "ticket=ST-138557-abc") {
+		t.Errorf("target: %s", target)
+	}
+
+	if _, ok := ticketTarget("https://sso.zxxk.com/login?service=%2F"); ok {
+		t.Error("false positive on plain login url")
+	}
+	if target, ok := ticketTarget("https://jumpserver.xkw.com/core/auth/cas/login/?ticket=ST-1"); !ok || !strings.Contains(target, "ST-1") {
+		t.Errorf("direct ticket not detected: %v %v", target, ok)
 	}
 }
 
