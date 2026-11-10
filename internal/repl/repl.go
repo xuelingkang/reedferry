@@ -50,7 +50,7 @@ type REPL struct {
 	// connect 连接指定资产；默认调用 session.Run，测试可注入 mock。
 	connect func(a jumpserver.Asset) error
 
-	// login 交互式登录（账号/密码/2FA 输入 + 写配置）；默认走真实登录流程，
+	// login 登录（微信扫码 + 可选 2FA + 写配置）；默认走真实登录流程，
 	// 测试可注入 mock。返回 ok=false 表示用户主动取消登录。
 	login func() (ok bool, err error)
 }
@@ -72,9 +72,6 @@ func Run() error {
 	r.printBanner()
 	return r.loop()
 }
-
-// loginRetryLimit 交互式登录的最多尝试次数（超出后退出登录流程）。
-const loginRetryLimit = 3
 
 // loginIfNeeded 启动时按需登录：Cookie 为空、或现有 Cookie 已失效
 // （401/302/403，经资产树根端点校验）时进入交互式登录，成功后把新会话
@@ -119,15 +116,14 @@ func (r *REPL) loginIfNeeded() error {
 	return nil
 }
 
-// interactiveLogin 执行一次交互式登录（账号/密码/2FA 隐藏回显输入），
-// 成功后把新 Cookie 写入配置并清空资产缓存（下次 list 重新拉取）。
+// interactiveLogin 执行一次登录（统一认证微信扫码 + 业务侧可选 2FA），
+// 成功后把新会话 Cookie 写入配置并清空资产缓存（下次 list 重新拉取）。
 // 返回 ok=false 表示用户主动取消登录。测试可注入 r.login 替代网络流程。
 //
-// 输入经登录分发通道（loginCh）读取，与会话模式同语义：唯一 stdin 读取
-// goroutine 按当前模式投递字节，登录输入不与命令循环/会话模式竞争抢读。
-// 配置了 username/password 时首次提交直接使用配置凭据（跳过对应交互输入）；
-// 配置凭据登录失败（账号密码错/触发图形验证码）时回退为交互式输入重试。
-// 2FA 动态验证码任何情况下都交互输入（隐藏回显，不落盘）。
+// 扫码与验证码输入经登录分发通道（loginCh）读取，与会话模式同语义：唯一
+// stdin 读取 goroutine 按当前模式投递字节，登录输入不与命令循环/会话模式
+// 竞争抢读。配置中留有统一认证会话 Cookie 时先尝试静默换票（CAS 会话未
+// 过期则无需扫码），失效时才渲染二维码。
 func (r *REPL) interactiveLogin() (ok bool, err error) {
 	if r.login != nil {
 		ok, err = r.login()
@@ -135,7 +131,7 @@ func (r *REPL) interactiveLogin() (ok bool, err error) {
 			return ok, err
 		}
 		// 登录 hook 已更新 r.cfg.Cookie：统一在此持久化（沿用 0600 原子写）
-		if err := r.persistLogin(false); err != nil {
+		if err := r.persistLogin(); err != nil {
 			return false, err
 		}
 		return true, nil
@@ -153,77 +149,52 @@ func (r *REPL) interactiveLogin() (ok bool, err error) {
 		r.loginMu.Unlock()
 	}()
 	hr := authui.NewHiddenReader(loginCh, int(os.Stdin.Fd()))
-	// 预填凭据：来自配置 username/password（可选）；2FA 动态验证码不预填
-	preset := authui.Credentials{Username: r.cfg.Username, Password: r.cfg.Password}
-	for attempt := 0; ; attempt++ {
-		// 配置凭据仅首次提交直接使用；登录失败后回退交互输入重试
-		usedPreset := attempt == 0 && preset.Username != "" && preset.Password != ""
-		if attempt > 0 {
-			preset = authui.Credentials{}
-		}
-		username, password, err := authui.ReadCredentials(hr, os.Stdout, preset)
+	ctx := context.Background()
+
+	flow, outcome, err := jumpserver.NewLoginFlow(ctx, r.cfg.Host, r.cfg.SSOCookie)
+	if err != nil {
+		return false, err
+	}
+	if outcome.NeedQR {
+		fmt.Fprintln(os.Stdout, "开始 JumpServer 登录（统一认证微信扫码；扫码后自动写入会话 Cookie）")
+		outcome, err = authui.WaitScan(ctx, flow, loginCh, os.Stdout)
 		if err != nil {
-			if errors.Is(err, authui.ErrNotTTY) || errors.Is(err, io.EOF) {
-				fmt.Fprintln(os.Stderr, "已取消登录；可编辑配置文件填入 Cookie 后输入 reload 生效")
+			if errors.Is(err, authui.ErrCancelled) {
+				fmt.Fprintln(os.Stderr, "已取消登录；可重新输入 login，或编辑配置文件粘贴 Cookie 后 reload")
 				return false, nil
 			}
 			return false, err
 		}
-		flow, err := jumpserver.NewLoginFlow(context.Background(), r.cfg.Host)
-		if err != nil {
-			return false, err
-		}
-		outcome, err := flow.SubmitCredentials(context.Background(), username, password)
-		if err != nil {
-			var le *jumpserver.LoginError
-			if errors.As(err, &le) {
-				switch le.Kind {
-				case jumpserver.LoginErrBadCredentials, jumpserver.LoginErrCaptcha:
-					// 账号密码错/图形验证码：提示后重新输入（最多 loginRetryLimit 次）
-					fmt.Fprintln(os.Stderr, "登录失败：", le.Msg)
-					if attempt+1 >= loginRetryLimit {
-						return false, fmt.Errorf("连续 %d 次登录失败，已退出登录流程（可稍后重试，或改用浏览器登录后复制 Cookie）", loginRetryLimit)
-					}
-					continue
-				default:
-					// 扫码/第三方登录、国密环境：环境不支持，直接返回给用户说明
-					return false, err
-				}
-			}
-			return false, err
-		}
-		// 2FA 挑战：循环直至登录完成（RunMFA 内部处理验证码错误重试）
-		for outcome.NeedMFA {
-			outcome, err = authui.RunMFA(context.Background(), flow, outcome.Prompt, hr, os.Stdout)
-			if err != nil {
-				if errors.Is(err, authui.ErrNotTTY) || errors.Is(err, io.EOF) {
-					fmt.Fprintln(os.Stderr, "已取消登录")
-					return false, nil
-				}
-				return false, err
-			}
-		}
-		// 登录完成：写入配置（沿用 0600 原子写，见 config.Save）
-		r.cfg.Cookie = outcome.Cookie
-		if err := r.persistLogin(usedPreset); err != nil {
-			return false, err
-		}
-		return true, nil
 	}
+	// 业务侧 2FA 挑战：循环直至登录完成（RunMFA 内部处理验证码错误重试）
+	for outcome.NeedMFA {
+		outcome, err = authui.RunMFA(ctx, flow, outcome.Prompt, hr, os.Stdout)
+		if err != nil {
+			if errors.Is(err, authui.ErrNotTTY) || errors.Is(err, io.EOF) {
+				fmt.Fprintln(os.Stderr, "已取消登录")
+				return false, nil
+			}
+			return false, err
+		}
+	}
+	// 登录完成：写入配置（沿用 0600 原子写，见 config.Save）
+	r.cfg.Cookie = outcome.Cookie
+	if outcome.SSOCookie != "" {
+		r.cfg.SSOCookie = outcome.SSOCookie
+	}
+	if err := r.persistLogin(); err != nil {
+		return false, err
+	}
+	return true, nil
 }
 
 // persistLogin 把已更新的会话 Cookie 写入配置并清空资产缓存。
-// usedPreset 表示本次登录是否直接使用配置中的账号密码（仅影响提示文案）。
-func (r *REPL) persistLogin(usedPreset bool) error {
+func (r *REPL) persistLogin() error {
 	if err := config.Save(r.cfg); err != nil {
 		return fmt.Errorf("登录成功但写入配置失败：%w", err)
 	}
 	r.assets = nil // 新会话：清空资产缓存，下次 list 重新拉取
-	if usedPreset {
-		fmt.Fprintln(os.Stdout, "登录成功，会话 Cookie 已写入配置文件（账号密码沿用配置；2FA 动态验证码未保存）")
-	} else {
-		fmt.Fprintln(os.Stdout, "登录成功，会话 Cookie 已写入配置文件（本次输入的账号密码不会保存）")
-	}
+	fmt.Fprintln(os.Stdout, "登录成功，会话 Cookie 已写入配置文件（统一认证会话一并保存，下次过期可免扫码续期）")
 	return nil
 }
 
@@ -278,7 +249,7 @@ func (r *REPL) loadConfig() error {
 	}
 	r.cfg = cfg
 	if cfg.Cookie == "" {
-		fmt.Printf("配置文件 %s 中 Cookie 为空：可直接输入 login 或重启 reedferry 交互式登录；也可编辑该文件填入 Cookie（浏览器登录后 F12 → Network → 任选请求 → 复制 Cookie 请求头），然后输入 reload 或重启生效。\n", config.Path())
+		fmt.Printf("配置文件 %s 中 Cookie 为空：可直接输入 login 或重启 reedferry 登录（微信扫码）；也可编辑该文件填入 Cookie（浏览器登录后 F12 → Network → 任选请求 → 复制 Cookie 请求头），然后输入 reload 或重启生效。\n", config.Path())
 	}
 	return nil
 }
@@ -587,7 +558,7 @@ func (r *REPL) cmdHelp() {
   <编号>           直接连接列表中的资产
   <主机名或IP>      直接输入名称连接
   reload / r       重新拉取资产（编辑配置文件后生效）
-  login            重新登录（交互式输入账号密码，自动更新会话 Cookie）
+  login            重新登录（微信扫码，自动更新会话 Cookie）
   help / ?         显示本帮助
   exit / quit      退出（Ctrl-D 同样可退出）
 `)

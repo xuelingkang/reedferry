@@ -8,6 +8,7 @@
 | --- | --- | --- |
 | 设计助手（AI Agent） | 详细设计定稿：交互式 REPL、模块划分、WebSocket 协议（协议实测结论见附录 D） | 2026-08-13 |
 | 开发（AI Agent） | 新增自动登录：程序内交互式登录换取会话 Cookie（含 2FA），登录流程实测结论见附录 D V5；新增 authui 模块 | 2026-09-04 |
+| 开发（AI Agent） | 登录改为统一认证微信扫码（JumpServer 账号密码登录下线）：新增终端二维码渲染、免扫码续期（sso_cookie），删除账号密码加密链路 | 2026-11-10 |
 
 # 1. 项目概述
 
@@ -57,16 +58,18 @@ Web 终端能力在线、审计链路完整，但浏览器终端缺少本地终�
 ### FR-1 配置管理
 
 - 首次运行：配置文件不存在时**自动创建示例模板**（占位 host + 空 cookie），提示用户编辑 `~/.config/reedferry/config.json`（权限 0600）；
-- 配置存在但 Cookie 为空：启动时引导交互式登录（输入账号密码，密码隐藏回显），也保留"编辑 <路径> 填入 Cookie"（浏览器登录后 F12 → Network → 任选请求 → 复制 Cookie 请求头）的原有方式；
+- 配置存在但 Cookie 为空：启动时引导扫码登录（终端渲染统一认证微信二维码），也保留"编辑 <路径> 填入 Cookie"（浏览器登录后 F12 → Network → 任选请求 → 复制 Cookie 请求头）的原有方式；
 - 编辑配置后输入 `reload` 或重启生效；Cookie 脱敏展示（仅前后 8 字符）供核验。
 
 ### FR-4 自动登录
 
 - 触发时机：Cookie 为空（首次/清空）、或现有 Cookie 已失效（API 返回 401/302/403）时；REPL 内 `login` 命令可随时手动触发；
-- 交互方式：提示输入 JumpServer 账号与密码（密码隐藏回显，不打印、不写日志、不落盘）；系统要求 2FA 时提示输入 JumpServer 2FA 动态验证码（明确标注为 2FA），验证码错误可重新输入（上限 3 次）；
-- 成功后自动把会话 Cookie 写入配置文件（沿用 0600 原子写），随后 list/连接资产直接可用；
-- 失败区分：账号密码错 / 验证码错 / 网络不可达 / 图形验证码触发 / 扫码/第三方登录环境 / 国密环境，给出可操作提示；
-- 安全约束：账号密码与 2FA 验证码仅用于本次会话换取 Cookie，任何情况下不持久化；登录流程不阻塞启动——用户取消、网络失败等均进入 REPL（可稍后 `login` 或手动粘贴 Cookie）。
+- 登录方式：JumpServer 认证已外抛给统一认证（CAS），程序内不接触账号密码——在终端渲染微信扫码二维码，用户用微信扫码并确认授权，程序轮询扫码状态并自动换票；
+- 免扫码续期：登录同时保存统一认证域会话（`sso_cookie`）；业务会话过期时先带该会话静默换票，统一认证会话也过期才重新出二维码；
+- 业务侧 2FA：若 JumpServer 仍对该账号要求 2FA，扫码完成后提示输入动态验证码（隐藏回显），验证码错误可重新输入（上限 3 次）；
+- 成功后自动把业务域与统一认证域会话 Cookie 写入配置文件（沿用 0600 原子写），随后 list/连接资产直接可用；
+- 失败区分：扫码取消 / 二维码过期（自动刷新，上限 3 次） / 微信未绑定账号 / 验证码错 / 网络不可达，给出可操作提示；
+- 安全约束：程序内不接触账号密码；2FA 验证码与扫码输入不打印、不写日志、不落盘；登录流程不阻塞启动——用户取消、网络失败等均进入 REPL（可稍后 `login` 或手动粘贴 Cookie）。
 
 ### FR-2 资产列表
 
@@ -247,28 +250,33 @@ reedferry/
 
 * **功能描述**
 
-  封装与 JumpServer 的全部交互：REST 查询资产与可用账号、创建建连 token、建立 koko WebSocket 通道、消息编解码（Text JSON 控制帧 + Binary 裸字节），以及程序内登录流程（交互式账号密码 + 可选 2FA，换取会话 Cookie）。登录实现细节与实探结论见附录 D V5。
+  封装与 JumpServer 的全部交互：REST 查询资产与可用账号、创建建连 token、建立 koko WebSocket 通道、消息编解码（Text JSON 控制帧 + Binary 裸字节），以及程序内登录流程（统一认证微信扫码 + 业务侧可选 2FA，换取会话 Cookie）。登录实现细节与实探结论见附录 D V5。
 
 * **接口设计**
 
   ```go
-  // 登录流程（纯 HTTP 客户端，无浏览器依赖；密码加密与前端 session-encrypt.js 对齐）
+  // 登录流程（纯 HTTP 客户端，无浏览器依赖；CAS 扫码 + 可选业务侧 2FA，见附录 D V5）
   type LoginFlow struct{ ... }
-  func NewLoginFlow(ctx, host string) (*LoginFlow, error)   // 打开登录页：取 csrf、探测 RSA/国密方案
-  func (f *LoginFlow) SubmitCredentials(ctx, username, password string) (*LoginOutcome, error)
-      // POST /core/auth/login/（表单：csrfmiddlewaretoken/username/password/auto_login）
-      // 密码 = AES/ECB/ZeroPadding（随机 key）加密，key 用 RSA 公钥（PKCS1v1.5）加密，
-      // 输出 "{rsaKeyCipher}:{aesPasswordCipher}"（均 base64，与 session-encrypt.js 一致）
-      // 302 → guard 分流；200 → 账号密码错 / 图形验证码触发
+  func NewLoginFlow(ctx, host, ssoCookie string) (*LoginFlow, *LoginOutcome, error)
+      // 业务 CAS 入口（发现 SSO 域与 service）→ 带上次 SSO 会话静默换票，或拉取扫码二维码
+  func (f *LoginFlow) QR() *QRCode          // 二维码内容（统一认证扫码入口 URL）
+  func (f *LoginFlow) RefreshQR(ctx) error  // 二维码过期刷新（同一扫码会话，令牌不变）
+  func (f *LoginFlow) PollScan(ctx) (ScanStatus, *LoginOutcome, error)
+      // 轮询扫码状态：LOGINING（已扫码待授权）/ LOGINED（完成）/ QUIT_LOGIN / ACCOUNT_BIND / EXPIRED
+      // LOGINED → dologin 确认 →（隐私协议分支）→ CAS 表单 _eventId=scanCodeLogin
+      // → 302 service?ticket=… → ticket 回跳业务侧 →（可选 MFA）→ 落地页取 CSRF → Cookie
   func (f *LoginFlow) SubmitMFA(ctx, code, mfaType string) (*LoginOutcome, error)
-      // POST /core/auth/login/mfa/（表单：csrfmiddlewaretoken/code/mfa_type）
-      // 2FA 动态验证码校验；错 → LoginErrBadMFA
+      // POST /core/auth/login/mfa/（业务侧 2FA，表单 csrfmiddlewaretoken/code/mfa_type）
+      // 错 → LoginErrBadMFA
   type LoginOutcome struct {
-      Cookie  string     // 登录完成后的会话 Cookie 串（写入配置文件）
-      NeedMFA bool       // 需要用户输入 2FA 动态验证码
-      Prompt  *MFAPrompt // NeedMFA 时的可用验证方式（type/label）
+      Cookie    string     // 业务域会话 Cookie（写入配置 cookie）
+      SSOCookie string     // 统一认证域会话 Cookie（写入配置 sso_cookie，免扫码续期）
+      NeedQR    bool       // 待展示二维码
+      NeedMFA   bool       // 待输入业务侧 2FA 验证码
+      QR        *QRCode    // NeedQR 时的扫码挑战（content/token/version）
+      Prompt    *MFAPrompt // NeedMFA 时的可用验证方式（type/label）
   }
-  type LoginError struct{ Kind LoginErrorKind; Msg string } // 错误分类（账号密码错/验证码错/图形验证码/第三方登录/国密）
+  type LoginError struct{ Kind LoginErrorKind; Msg string } // 错误分类（验证码错/扫码取消/二维码过期/需绑定账号）
   ```
 
   ```go
@@ -498,8 +506,8 @@ reedferry/
 
 | 项 | 说明 |
 | --- | --- |
-| 认证方式 | 请求头 `Cookie: sessionid=...; jms_csrftoken=...`（程序内登录或浏览器会话两种来源），无令牌刷新逻辑；CSRF 头 `X-CSRFToken` 取 cookie 中的 `jms_csrftoken`（JumpServer 自定义 cookie 名，非 Django 默认 csrftoken） |
-| 登录流程 | 程序内交互式登录：GET 登录页（取 csrf + 加密公钥）→ POST 表单（RSA/AES 加密密码）→ 302 guard →（可选）2FA 页提交动态验证码 → 提取会话 Cookie；细节与实探结论见附录 D V5 |
+| 认证方式 | 请求头 `Cookie: jms_sessionid=...; jms_csrftoken=...`（程序内扫码登录或浏览器会话两种来源），无令牌刷新逻辑；CSRF 头 `X-CSRFToken` 取 cookie 中的 `jms_csrftoken`（JumpServer 自定义 cookie 名，非 Django 默认 csrftoken） |
+| 登录流程 | 程序内扫码登录：业务 CAS 入口 → 统一认证微信扫码（轮询 → 换票）→ ticket 回跳业务侧 →（可选）2FA 动态验证码 → 落地页取 CSRF → 提取会话 Cookie；细节与实探结论见附录 D V5 |
 | 资产列表 | `GET {host}/api/v1/perms/users/self/nodes/children-with-assets/tree/`（无 key 返回根节点，带 `key={节点id}` 逐层展开，BFS 收集资产叶子；v3 实测） |
 | 系统用户 | `GET {host}/api/v1/perms/users/self/assets/{asset_id}/`（解析 `permed_accounts` 数组，账号 id/alias 作 token 的 account；v3 实测） |
 | 建连 token | `POST {host}/api/v1/authentication/connection-token/`（头带 `Cookie` + `X-CSRFToken` + `Referer`；体含 asset/account/protocol 等，返回 201 `{id, value}`；v3 实测，见附录 D V3） |
@@ -541,8 +549,8 @@ config   ──调用──> jumpserver（无——校验由 repl/session 完成
 
 | 项 | 方案 |
 | --- | --- |
-| 身份认证 | 会话 Cookie 两种来源：程序内交互式登录（账号密码 + 可选 2FA，登录页 RSA/AES 加密协议，见附录 D V5）或手动复制浏览器会话 Cookie；程序内不持久化任何口令 |
-| 凭据安全 | 账号密码与 2FA 验证码仅存于本次调用栈：输入隐藏回显（x/term.ReadPassword）、不打印、不写日志、不落盘，任何情况下不持久化；登录失败错误信息不含凭据 |
+| 身份认证 | 会话 Cookie 两种来源：程序内扫码登录（统一认证微信扫码 + 可选业务侧 2FA，见附录 D V5）或手动复制浏览器会话 Cookie；程序内不接触账号密码 |
+| 凭据安全 | 程序内不收集账号密码；2FA 验证码仅存于本次调用栈（隐藏回显、不打印、不写日志、不落盘）；业务域与统一认证域会话 Cookie 分开存储、分开发送 |
 | 传输加密 | 全程 TLS（wss:// 与 https://）；证书校验保持开启，如 JumpServer 使用自签证书导致 TLS 校验失败时，评估显式 `--insecure` 开关（默认关闭） |
 | 本地存储 | Cookie 写入 `~/.config/reedferry/config.json`，文件权限 0600；展示时脱敏（仅前后 8 字符） |
 | 审计 | 连接链路与浏览器 Web 终端完全一致（同 koko、同系统用户），JumpServer 侧审计记录天然生效，Reedferry 不做旁路 |
@@ -552,7 +560,7 @@ config   ──调用──> jumpserver（无——校验由 repl/session 完成
 
 - 输入注入：REPL 命令仅作字符串匹配（主机名/IP 精确匹配、编号索引），不拼接 shell 命令；
 - Cookie 泄露面：仅存本机 0600 文件，提示用户"Cookie 含登录凭据，勿提交至版本库"（README 同步提示）；
-- 依赖更新：gorilla/websocket、golang.org/x/term 保持最新稳定版，`go mod tidy` 定期执行。
+- 依赖更新：gorilla/websocket、golang.org/x/term、rsc.io/qr 保持最新稳定版，`go mod tidy` 定期执行。
 
 # 8. 项目实施计划
 
@@ -741,21 +749,19 @@ config   ──调用──> jumpserver（无——校验由 repl/session 完成
 
 ### V5：登录流程（实测结论）
 
-**结论（jumpserver.xkw.com，JumpServer v3.x 实探）**：程序内登录可通过纯 HTTP 完成，含 2FA（TOTP）挑战。
+**结论（2026-11 实测，jumpserver.xkw.com + sso.zxxk.com）**：JumpServer 已关闭账号密码登录，认证整体外抛给公司统一认证（CAS）。程序内登录改走扫码链路：纯 HTTP 驱动、终端渲染二维码，扫码由人完成；业务侧 2FA 分支保留。
 
-1. **GET `/core/auth/login/`** 返回 200 HTML，响应种下 `jms_csrftoken` / `jms_public_key` / `jms_sessionid`（匿名会话）/ `SESSION_COOKIE_NAME_PREFIX=jms_` / `acw_tc` 等 Cookie；页面含 `csrfmiddlewaretoken` 隐藏字段。密码加密公钥在 Cookie `jms_public_key`（base64(PEM PUBLIC KEY)）；实测该环境**不种** `jms_gm_ssl`（非国密），若某环境种 `jms_gm_ssl=1` 则为 SM2/SM4 国密方案——当前版本不支持，登录时报错并提示改用浏览器复制 Cookie。
-2. **POST `/core/auth/login/`**（`application/x-www-form-urlencoded`，带当前 csrfmiddlewaretoken）：字段 `csrfmiddlewaretoken` / `username` / `password` / `auto_login`。密码按前端 session-encrypt.js 逻辑加密：随机 AES key（前端 `(Math.random()+1).toString(36).substring(2)` 形态）→ AES/ECB/ZeroPadding 加密密码（key 补零到 16 字节，不足 16 倍数补零、整倍数不补块）；AES key 用 RSA 公钥（PKCS1 v1.5）加密 → 输出 `{rsaKeyCipher}:{aesPasswordCipher}`（均标准 base64）。实测正确提交后 **302 → `/core/auth/login/guard/?_=ok`**（状态码 302）；错误密码 200 重渲染登录页，错误文案在 `<p class="help-block red-fonts">`，连续失败后登录页出现图形验证码（字段 `captcha_0`（hidden key）+ `captcha_1`，另有 `challenge` 形态），程序内无法自动识别。
-3. **GET `/core/auth/login/guard/`**（302 链中间站）：需要 2FA 时 302 → `/core/auth/login/mfa/`；否则 302 → 业务首页 `/`（登录完成）。guard 302 回 `/core/auth/login/?_=session_empty` 表示会话未建立（登录实际失败）。
-4. **GET `/core/auth/login/mfa/`** 返回 200，页面含 csrfmiddlewaretoken、`<select name="mfa_type">`（选项为可用 MFA 方式，`disabled` 项不可用）与动态验证码输入框；2FA 方式实测支持 TOTP（`otp`），其余如 SMS 依赖短信网关配置。
-5. **POST `/core/auth/login/mfa/`**（表单 `csrfmiddlewaretoken` / `code` / `mfa_type`，mfa_type 取 select 选项值）：正确 → 302 → guard → 业务首页；错误 → 200 重渲染 MFA 页（错误文案可提取）。
-6. 302 链到业务首页（非 mfa/guard/第三方路径）即登录完成：用 Cookie Jar 收集服务端种下的全部会话 Cookie（`jms_sessionid` 等），序列化为 `k=v; k2=v2` 写入配置文件（0600 原子写）。登录完成后的 Cookie 可直接用于现有 API/WS 流程（含 `jms_csrftoken`）。
+1. **GET `/core/auth/login/`** 302 → `/core/common/flash-message/`（内容只有「正在跳转到 CAS 认证」）；登录页不再提供账号密码表单，原账号密码协议（RSA/AES 加密、图形验证码、国密）随之下线。
+2. **GET `/core/auth/cas/login/`**（业务侧 CAS 入口）302 → `https://sso.zxxk.com/login?service=<encodeURIComponent(业务 CAS 入口)>`。SSO 域由该跳转发现，不设配置项。
+3. **GET SSO 登录页** 200，页面内联脚本给出 `var qrToken = "..."`；CAS webflow 字段（`execution` / `flowId` / `_eventId` 等）为页面 hidden input，提交时原样带回。SSO 会话仍有效时该 GET 直接 302 回 `service?ticket=…`（免扫码）。
+4. **扫码挑战**：`GET /user/qrcode/qrcode-login/v2/content?token={qrToken}&service={service}` → `{data:{content, queryToken:{token,version}}}`；`content` 即二维码承载的 URL（`https://sso.zxxk.com/login?key=…&type=qrcode-login`），不是微信开放平台的 `qrconnect` 链接。
+5. **状态轮询**：`GET /user/wechat-applet/logincheck?token=&version=`（version 每次自增；缺任一参数或跨会话返回 `data:null`，等同于「未扫码」）→ `LOGINING`（已扫码待授权）/ `LOGINED`（完成）/ `QUIT_LOGIN`（微信侧取消）/ `ACCOUNT_BIND`（微信未绑定账号）/ `EXPIRED`（过期，可刷新）。
+6. **扫码完成收尾**：`GET /user/wechat-applet/dologin?service=…` → `{status, message}`；无扫码状态时返回「二维码已失效」（它是扫码会话的收尾，不是会话探针）。message 含「同意」表示该账号首次登录需同意隐私协议，须先 `POST /user/set-activate-flag`（表单 `loginInfo`），否则停在「扫码成功进不去」。
+7. **CAS 换票**：`POST` 回 SSO 登录页，表单带上页面全部 hidden 字段并把 `_eventId` 覆盖为 `scanCodeLogin` → 302 `service?ticket=ST-…`。
+8. **ticket 回跳**：`GET {业务}/core/auth/cas/login/?ticket=…`，服务端回 SSO 校验后种 `jms_sessionid`；伪造 ticket 只会 302 到 `/` 且 API 401（正常拒绝，不是端点故障）。随后仍可能 302 → `/core/auth/login/guard/` → `/core/auth/login/mfa/`（业务侧 2FA），提交 `code`+`mfa_type` 与旧流程一致。
+9. **落地页消费**：登录后必须先 GET 落地页再序列化 Cookie——`jms_csrftoken` 只在渲染带 CSRF 的页面时种下；只拿到 302 Location 就序列化，后续 `connection-token` 会报 `token from header incorrect`。
+10. **落盘**：业务域 Cookie（`jms_sessionid` / `jms_csrftoken`）写 `cookie`，SSO 域 Cookie（CAS 会话）写 `sso_cookie`；两者按域分开序列化，业务请求不携带 SSO Cookie。
 
-**已确认的未支持场景（不硬编码臆测接口，报错提示替代路径）**：
+**已确认的未支持场景**：微信未绑定 SSO 账号（`ACCOUNT_BIND`）需先在浏览器完成一次绑定；SSO 侧若追加设备指纹/图形验证码风控，扫码链路可能失效，此时退回手动复制 Cookie。
 
-- **国密环境**（`jms_gm_ssl=1`）：需 SM2/SM4 加密，当前不实现，报错提示改用浏览器复制 Cookie；
-- **扫码/第三方登录**（302 → `/core/auth/wecom|dingtalk|feishu|lark|slack/*/qr/login/`、OpenID/CAS/SAML2/OAuth2）：无法纯 HTTP 完成，报错提示改用浏览器复制 Cookie；
-- **图形验证码**（登录页出现 `captcha_0`/`challenge` 字段）：程序内无法自动识别，报错提示稍后重试或改用浏览器复制 Cookie。
-
-**代码落点**：`internal/jumpserver/login.go`（LoginFlow：加密、302 链、MFA、Cookie 提取）+ `internal/authui/authui.go`（隐藏回显输入）+ `internal/repl/repl.go`（登录编排：Cookie 为空/失效自动触发、`login` 命令、失败分类提示）。
-
-**MFA 纯 HTTP 可行性结论**：本环境（TOTP 方式）可纯 HTTP 完成（提交 code+mfa_type 表单）；若某环境仅开放扫码类 MFA（如强制微信/企业微信扫码），则无法纯 HTTP 完成——程序已按 302 目标路径检测并给出替代路径提示，不臆测接口。
+**代码落点**：`internal/jumpserver/login.go`（LoginFlow：入口发现、二维码、扫码轮询、换票、MFA、双域 Cookie）+ `internal/authui/authui.go`（终端二维码渲染、扫码等待、2FA 输入）+ `internal/repl/repl.go`（登录编排与持久化）。

@@ -1,13 +1,12 @@
-// Package authui 提供交互式登录的用户界面：账号/密码/2FA 验证码的终端输入
-// 与登录结果提示。
+// Package authui 提供交互式登录的用户界面：微信扫码二维码渲染、扫码等待、
+// 2FA 验证码终端输入与登录结果提示。
 //
 // 输入模型：登录输入不直接读 os.Stdin，而是经 REPL 的 stdin 分发通道
 // （HiddenReader，与会话模式同一通道语义）读取，避免与命令循环/会话模式
 // 竞争抢读（见 repl.loop 输入模型）。回显控制基于 termios ioctl
 // （golang.org/x/sys/unix，机制与 golang.org/x/term.ReadPassword 相同）：
-// 账号字段开启回显，密码/2FA 验证码字段关闭回显。输入内容仅存于本次调用栈，
-// 不打印、不写日志；密码可由用户选择存入配置（0600），2FA 动态验证码任何
-// 情况下不落盘（设计文档 7.1）。
+// 2FA 验证码字段关闭回显，输入内容仅存于本次调用栈，不打印、不写日志、
+// 不落盘（设计文档 7.1）。
 package authui
 
 import (
@@ -15,19 +14,15 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"os"
 	"strings"
+	"time"
 
 	"golang.org/x/sys/unix"
+	"rsc.io/qr"
 
 	"reedferry/internal/jumpserver"
 )
-
-// Credentials 登录凭据（可选预填）：配置了 username/password 时跳过对应
-// 交互输入。2FA 动态验证码不在此列（任何情况下不落盘）。
-type Credentials struct {
-	Username string
-	Password string
-}
 
 // HiddenReader 从 stdin 分发通道（REPL 登录模式的输入通道，见 repl.loop
 // 输入模型）逐字节读取登录输入。ECHO 开关需要真实 TTY fd——登录输入
@@ -82,13 +77,9 @@ func (r *HiddenReader) SetEcho(on bool) error {
 	return nil
 }
 
-// prompt 显示提示后从登录通道读取一行；secret=true 时关闭回显（密码/验证码），
-// 否则保持回显（账号）。读取后恢复回显，避免影响 REPL 后续输入。
+// prompt 显示提示后从登录通道读取一行；secret=true 时关闭回显（验证码），
+// 否则保持回显。读取后恢复回显，避免影响 REPL 后续输入。
 // Ctrl-D（EOF）经 readLineRaw 返回 io.EOF，由调用方按取消处理。
-//
-// 回显开关通过 termios ioctl 操作绑定终端 fd（NewHiddenReader 的 fd 参数）。
-// fd 非 TTY 时 SetEcho 返回 ErrNotTTY（非交互场景，读取照常进行但回显不受控）；
-// 只有非 ErrNotTTY 的回显开关错误（真实终端异常）才终止读取。
 func (r *HiddenReader) prompt(out io.Writer, text string, secret bool) (string, error) {
 	if err := r.SetEcho(!secret); err != nil && !errors.Is(err, ErrNotTTY) {
 		return "", err
@@ -108,42 +99,203 @@ func (r *HiddenReader) prompt(out io.Writer, text string, secret bool) (string, 
 	return strings.TrimSpace(line), nil
 }
 
-// ReadCredentials 交互式读取 JumpServer 账号与密码（in 必须为 *HiddenReader，
-// 经 REPL 登录分发通道读取）。preset 提供预填凭据（来自配置 username/password）：
-// 非空字段跳过对应交互输入（配置凭据失败后重试回退交互输入，见
-// repl.interactiveLogin）。非交互终端（fd 非 TTY）返回 ErrNotTTY；
-// Ctrl-D（EOF）取消登录。
-func ReadCredentials(in io.Reader, out io.Writer, preset Credentials) (username, password string, err error) {
-	hr, ok := in.(*HiddenReader)
-	if !ok {
-		return "", "", ErrNotTTY
+// RenderQR 把 content 渲染为终端二维码（半块字符 + 强制黑底白面的 ANSI
+// 配色，避免深色终端把二维码反色导致识别不到）。非交互输出（非字符设备）
+// 只打印内容 URL，供用户自行在二维码生成器中使用。
+func RenderQR(w io.Writer, content string) error {
+	if !isCharDevice(w) {
+		fmt.Fprintf(w, "登录二维码内容：%s\n", content)
+		return nil
 	}
-	if preset.Username != "" && preset.Password != "" {
-		fmt.Fprintln(out, "开始 JumpServer 登录（账号密码已从配置文件读取，仅用于本次换取会话 Cookie；2FA 动态验证码不会保存）")
-	} else {
-		fmt.Fprintln(out, "开始 JumpServer 登录（账号密码仅用于本次换取会话 Cookie，不会保存）")
+	art, err := renderQRCode(content)
+	if err != nil {
+		return err
 	}
-	username = preset.Username
-	if username == "" {
-		username, err = hr.prompt(out, "JumpServer 账号: ", false)
-		if err != nil {
-			return "", "", err
+	_, err = io.WriteString(w, art)
+	return err
+}
+
+// renderQRCode 生成终端二维码文本（半块字符 + ANSI 黑白配色）。
+func renderQRCode(content string) (string, error) {
+	code, err := qr.Encode(content, qr.M)
+	if err != nil {
+		return "", fmt.Errorf("生成二维码失败：%w", err)
+	}
+	const quiet = 2 // 静区：二维码四周留白，缺了扫不出来
+	size := code.Size + quiet*2
+	black := func(x, y int) bool {
+		return code.Black(x-quiet, y-quiet)
+	}
+	var b strings.Builder
+	for y := 0; y < size; y += 2 {
+		b.WriteString("\x1b[30;47m") // 前景黑、背景白
+		for x := 0; x < size; x++ {
+			top := black(x, y)
+			bottom := false
+			if y+1 < size {
+				bottom = black(x, y+1)
+			}
+			switch {
+			case top && bottom:
+				b.WriteString("█")
+			case top:
+				b.WriteString("▀")
+			case bottom:
+				b.WriteString("▄")
+			default:
+				b.WriteString(" ")
+			}
+		}
+		b.WriteString("\x1b[0m\n")
+	}
+	return b.String(), nil
+}
+
+// ScanFlow 是扫码登录流程的最小接口（*jumpserver.LoginFlow 实现），
+// 便于将等待逻辑与网络流程分开测试。
+type ScanFlow interface {
+	QR() *jumpserver.QRCode
+	RefreshQR(ctx context.Context) error
+	PollScan(ctx context.Context) (jumpserver.ScanStatus, *jumpserver.LoginOutcome, error)
+}
+
+// WaitScan 渲染二维码并等待扫码完成：轮询扫码状态、提示进度、支持
+// 「r 刷新二维码」「q 取消」。二维码过期时自动刷新（最多 qrRefreshLimit 次）。
+// 扫码成功后可能仍返回 NeedMFA（业务侧 2FA），由调用方继续处理。
+func WaitScan(ctx context.Context, flow ScanFlow, input <-chan []byte, out io.Writer) (*jumpserver.LoginOutcome, error) {
+	const qrRefreshLimit = 3
+	qr := flow.QR()
+	if qr == nil {
+		return nil, errors.New("登录流程未提供二维码")
+	}
+	if err := RenderQR(out, qr.Content); err != nil {
+		return nil, err
+	}
+	fmt.Fprintln(out, "请用微信扫描上方二维码完成登录（r 刷新二维码，q 取消）")
+
+	lineCh, stop := splitLines(input)
+	defer stop()
+
+	ticker := time.NewTicker(pollInterval)
+	defer ticker.Stop()
+
+	scanned := false
+	refreshes := 0
+	for {
+		select {
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		case line, ok := <-lineCh:
+			if !ok {
+				return nil, ErrCancelled
+			}
+			switch strings.ToLower(strings.TrimSpace(line)) {
+			case "q", "quit", "exit":
+				return nil, ErrCancelled
+			case "r", "refresh":
+				if err := refreshQR(ctx, flow, out); err != nil {
+					return nil, err
+				}
+				scanned = false
+			default:
+				fmt.Fprintln(out, "等待扫码中：r 刷新二维码，q 取消")
+			}
+		case <-ticker.C:
+			status, outcome, err := flow.PollScan(ctx)
+			if err != nil {
+				var le *jumpserver.LoginError
+				if errors.As(err, &le) && le.Kind == jumpserver.LoginErrQRExpired {
+					if refreshes >= qrRefreshLimit {
+						return nil, errors.New("二维码多次过期，已取消登录")
+					}
+					refreshes++
+					fmt.Fprintln(out, "二维码已过期，正在刷新…")
+					if err := refreshQR(ctx, flow, out); err != nil {
+						return nil, err
+					}
+					scanned = false
+					continue
+				}
+				return nil, err
+			}
+			if outcome != nil {
+				return outcome, nil
+			}
+			if status == jumpserver.ScanScanned && !scanned {
+				scanned = true
+				fmt.Fprintln(out, "已扫码，请在微信中确认授权…")
+			}
 		}
 	}
-	if username == "" {
-		return "", "", errors.New("账号不能为空")
+}
+
+// refreshQR 重新拉取二维码内容并重绘。
+func refreshQR(ctx context.Context, flow ScanFlow, out io.Writer) error {
+	if err := flow.RefreshQR(ctx); err != nil {
+		return err
 	}
-	password = preset.Password
-	if password == "" {
-		password, err = hr.prompt(out, "JumpServer 密码: ", true)
-		if err != nil {
-			return "", "", err
+	qr := flow.QR()
+	if qr == nil {
+		return errors.New("刷新二维码后内容为空")
+	}
+	if err := RenderQR(out, qr.Content); err != nil {
+		return err
+	}
+	fmt.Fprintln(out, "二维码已刷新，请用微信扫描（r 刷新二维码，q 取消）")
+	return nil
+}
+
+// pollInterval 扫码状态轮询间隔（与 SSO 前端一致；包级变量便于测试调小）。
+var pollInterval = 1500 * time.Millisecond
+
+// splitLines 把 stdin 分发通道的字节块按行拆开，返回行通道与停止函数。
+// 停止后读取 goroutine 立即退出，不残留阻塞在通道上的协程。
+func splitLines(input <-chan []byte) (<-chan string, func()) {
+	lines := make(chan string, 4)
+	done := make(chan struct{})
+	go func() {
+		defer close(lines)
+		var sb strings.Builder
+		for {
+			select {
+			case <-done:
+				return
+			case b, ok := <-input:
+				if !ok {
+					// 通道关闭：把残留内容当最后一行
+					if sb.Len() > 0 {
+						select {
+						case lines <- sb.String():
+						case <-done:
+						}
+					}
+					return
+				}
+				for _, c := range b {
+					if c == '\n' {
+						select {
+						case lines <- sb.String():
+						case <-done:
+							return
+						}
+						sb.Reset()
+						continue
+					}
+					if c != '\r' {
+						sb.WriteByte(c)
+					}
+				}
+			}
 		}
+	}()
+	var once bool
+	return lines, func() {
+		if once {
+			return
+		}
+		once = true
+		close(done)
 	}
-	if password == "" {
-		return "", "", errors.New("密码不能为空")
-	}
-	return username, password, nil
 }
 
 // RunMFA 提示用户输入 JumpServer 2FA 动态验证码并提交；验证码错误时提示
@@ -182,6 +334,9 @@ func RunMFA(ctx context.Context, flow *jumpserver.LoginFlow, prompt *jumpserver.
 	return nil, errors.New("2FA 验证码错误次数过多，已取消登录（账号未被锁定，可稍后重试）")
 }
 
+// ErrCancelled 表示用户主动取消登录（输入 q 或关闭输入）。
+var ErrCancelled = errors.New("已取消登录")
+
 // ErrNotTTY 表示 stdin 不是交互式终端，无法进行隐藏回显输入。
 var ErrNotTTY = errors.New("登录需要交互式终端（stdin 不是 TTY）；可在终端中运行 reedferry，或改用浏览器登录后复制 Cookie 到配置文件")
 
@@ -208,4 +363,17 @@ func readLineRaw(in io.Reader) (string, error) {
 			return sb.String(), err
 		}
 	}
+}
+
+// isCharDevice 判断输出是否为字符设备（终端）：非终端不写 ANSI 转义序列。
+func isCharDevice(w io.Writer) bool {
+	f, ok := w.(*os.File)
+	if !ok {
+		return false
+	}
+	fi, err := f.Stat()
+	if err != nil {
+		return false
+	}
+	return fi.Mode()&os.ModeCharDevice != 0
 }

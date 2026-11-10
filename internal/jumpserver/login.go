@@ -2,16 +2,10 @@ package jumpserver
 
 import (
 	"context"
-	"crypto/aes"
-	"crypto/rand"
-	"crypto/rsa"
-	"crypto/x509"
-	"encoding/base64"
-	"encoding/pem"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
-	"math/big"
 	"net/http"
 	"net/http/cookiejar"
 	"net/url"
@@ -19,25 +13,30 @@ import (
 	"strings"
 )
 
-// 登录流程：纯 HTTP 客户端完成 JumpServer 账号密码登录（可选 2FA），
-// 换取会话 Cookie 供后续 API/WS 使用。约束：不引入浏览器/无头浏览器，
-// 账号密码与验证码仅存于本次调用栈，不落盘、不打印、不写日志。
+// 登录流程（2026-11 实测）：JumpServer 已关闭账号密码登录，认证整体外抛给
+// 公司统一认证 sso.zxxk.com（CAS）：
+//   - GET /core/auth/login/ 302 到业务侧 CAS 入口 /core/auth/cas/login/；
+//   - CAS 入口 302 到 SSO 登录页 sso.zxxk.com/login?service=…；
+//   - SSO 登录页只剩微信扫码（账号密码入口已下线），扫码状态经
+//     /user/wechat-applet/logincheck 轮询，扫码完成后 dologin 收尾，
+//     再以 CAS webflow 表单（_eventId=scanCodeLogin）换回 service?ticket=；
+//   - ticket 回跳业务侧 CAS 入口，服务端校验后种 jms_sessionid；业务侧自身的
+//     MFA 分支（guard → /core/auth/login/mfa/）仍可能被触发。
 //
-// 流程为 jumpserver.xkw.com（JumpServer v3.x）实探结论（设计文档附录 D V5）：
-//   - GET /core/auth/login/ 返回 200，页面含 csrfmiddlewaretoken，响应种下
-//     jms_csrftoken / jms_public_key / jms_sessionid 等 Cookie；
-//   - POST 表单（csrfmiddlewaretoken/username/password/auto_login）成功后
-//     302 到 /core/auth/login/guard/，guard 再 302 分流：需要 2FA 时跳
-//     /core/auth/login/mfa/（字段 code + mfa_type），否则直达业务首页；
-//   - MFA 页 GET 需先有会话（guard 302 前已写入 user_id/auth_password）；
-//   - 密码加密与前端 session-encrypt.js 一致：随机 AES key 经 AES/ECB/
-//     ZeroPadding 加密密码，AES key 用 RSA 公钥（PKCS1 v1.5）加密，
-//     输出 "{rsaKeyCipher}:{aesPasswordCipher}"（均 base64）。
+// 扫码必须由人完成；可自动化的是扫码之外的全部：拉二维码、渲染、轮询、换票、
+// 落盘。约束：不引入浏览器；业务域与 SSO 域的会话 Cookie 分开序列化。
 
 const (
+	casEntryPath   = "/core/auth/cas/login/"
 	loginPath      = "/core/auth/login/"
 	loginGuardPath = "/core/auth/login/guard/"
 	loginMFAPath   = "/core/auth/login/mfa/"
+
+	// SSO 扫码端点（sso.zxxk.com 前端 scan-code-*.js 实测）。
+	ssoQRContentPath = "/user/qrcode/qrcode-login/v2/content"
+	ssoScanCheckPath = "/user/wechat-applet/logincheck"
+	ssoDoLoginPath   = "/user/wechat-applet/dologin"
+	ssoActivatePath  = "/user/set-activate-flag"
 )
 
 // LoginErrorKind 登录失败分类，CLI 层据此给出针对性提示。
@@ -46,16 +45,14 @@ type LoginErrorKind int
 const (
 	// LoginErrOther 未分类错误。
 	LoginErrOther LoginErrorKind = iota
-	// LoginErrBadCredentials 账号或密码错误。
-	LoginErrBadCredentials
-	// LoginErrBadMFA 2FA 动态验证码错误。
+	// LoginErrBadMFA 业务侧 2FA 动态验证码错误。
 	LoginErrBadMFA
-	// LoginErrCaptcha 触发图形验证码，程序内无法自动识别。
-	LoginErrCaptcha
-	// LoginErrThirdParty 环境配置了扫码/第三方登录，无法纯 HTTP 完成。
-	LoginErrThirdParty
-	// LoginErrGMSSL 环境启用国密（SM2/SM4）密码加密，当前版本不支持。
-	LoginErrGMSSL
+	// LoginErrScanCancelled 微信侧取消授权。
+	LoginErrScanCancelled
+	// LoginErrQRExpired 二维码过期。
+	LoginErrQRExpired
+	// LoginErrAccountBind 微信身份尚未绑定统一认证账号。
+	LoginErrAccountBind
 )
 
 // LoginError 携带分类的登录错误。
@@ -94,169 +91,339 @@ func (p *MFAPrompt) Describe() string {
 	return strings.Join(labels, " / ")
 }
 
-// LoginOutcome 是登录一步的结果：未完成时 NeedMFA 为 true（需继续
-// SubmitMFA）；完成后 Cookie 为可写入配置文件的会话 Cookie 串。
-type LoginOutcome struct {
-	Cookie  string     // 登录完成后的会话 Cookie 串（未完成时为空）
-	NeedMFA bool       // 需要用户输入 2FA 动态验证码
-	Prompt  *MFAPrompt // NeedMFA 时的挑战信息
+// QRCode 是待展示的扫码挑战：Content 为二维码承载的 URL，Token/Version 用于轮询。
+type QRCode struct {
+	Content string
+	Token   string
+	Version int
 }
 
-// LoginFlow 驱动一次 JumpServer 登录：GET 登录页 → 提交凭据 →（可选 MFA）
-// → 提取 Cookie。全程使用同一 Cookie Jar 保存服务端下发的会话；
-// 302 链手动跟随（禁用自动重定向）以识别 MFA 分流。
+// LoginOutcome 是登录一步的结果：NeedQR（待扫码）、NeedMFA（待 2FA 验证码），
+// 或登录完成（Cookie / SSOCookie 可写入配置）。
+type LoginOutcome struct {
+	Cookie    string     // 业务域会话 Cookie（登录完成时有效）
+	SSOCookie string     // SSO 域会话 Cookie（用于下次静默换票）
+	NeedQR    bool       // 需要展示二维码并等待扫码
+	NeedMFA   bool       // 需要输入业务侧 2FA 验证码
+	QR        *QRCode    // NeedQR 时的扫码挑战
+	Prompt    *MFAPrompt // NeedMFA 时的挑战信息
+}
+
+// ScanStatus 是扫码轮询的中间状态（用于给用户显示进度）。
+type ScanStatus int
+
+const (
+	// ScanWaiting 尚未扫码。
+	ScanWaiting ScanStatus = iota
+	// ScanScanned 已扫码，等待微信内确认授权。
+	ScanScanned
+)
+
+// LoginFlow 驱动一次 SSO 扫码登录：业务 CAS 入口 → SSO 登录页 → 二维码
+// →（扫码）→ 换票 → 业务会话 Cookie。全程使用同一 Cookie Jar；302 手动
+// 跟随以识别 MFA 与换票分支。
 type LoginFlow struct {
 	host string
 	jar  *cookiejar.Jar
 	http *http.Client
 
-	loginURL string
-	mfaURL   string
+	service  string // 业务侧 CAS 回调地址（service 参数原值）
+	ssoBase  string // SSO 域基址（从第一跳 302 发现，不设配置项）
+	loginURL string // SSO 登录页完整 URL（含 service）
+	mfaURL   string // 业务侧 MFA 页
 
-	csrf string // 当前页面的 csrfmiddlewaretoken（登录页或 MFA 页）
+	form url.Values // 当前页 hidden 表单字段（CAS webflow / MFA 提交用）
+	qr   *QRCode
 }
 
-// NewLoginFlow 打开登录页并初始化流程（收集 csrf 与加密公钥等 Cookie）。
-// 网络不可达等错误直接返回；检测到国密方案（jms_gm_ssl=1）时返回
-// LoginErrGMSSL（本环境实测未启用，见附录 D V5）。
-func NewLoginFlow(ctx context.Context, host string) (*LoginFlow, error) {
+// NewLoginFlow 打开登录链路，推进到「待扫码」或「已完成」为止。
+// ssoCookie 为上次登录留下的 SSO 域会话 Cookie（可为空）：携带它访问 SSO
+// 登录页时，会话仍有效则 SSO 直接回 ticket，无需再次扫码。
+func NewLoginFlow(ctx context.Context, host, ssoCookie string) (*LoginFlow, *LoginOutcome, error) {
 	base := strings.TrimSuffix(host, "/")
+	if base == "" {
+		return nil, nil, errors.New("JumpServer 地址为空")
+	}
 	jar, err := cookiejar.New(nil)
 	if err != nil {
-		return nil, fmt.Errorf("初始化 Cookie Jar 失败：%w", err)
+		return nil, nil, fmt.Errorf("初始化 Cookie Jar 失败：%w", err)
 	}
 	client := &http.Client{
 		Timeout: apiTimeout,
-		Jar:     jar, // 会话 Cookie 由服务端种入 Jar，登录完成后序列化写入配置
-		// 302 链手动跟随：登录成功的跳转（guard → mfa/首页）需要逐跳识别
+		Jar:     jar,
+		// 302 链手动跟随：换票、guard 分流、MFA 分支需逐跳识别
 		CheckRedirect: func(*http.Request, []*http.Request) error {
 			return http.ErrUseLastResponse
 		},
 	}
 	f := &LoginFlow{
-		host:     base,
-		jar:      jar,
-		http:     client,
-		loginURL: base + loginPath,
-		mfaURL:   base + loginMFAPath,
+		host:   base,
+		jar:    jar,
+		http:   client,
+		mfaURL: base + loginMFAPath,
 	}
-	if err := f.openLoginPage(ctx); err != nil {
-		return nil, err
+
+	// 第一跳：业务侧 CAS 入口，暴露 SSO 域与 service
+	location, err := f.redirectTarget(ctx, base+casEntryPath)
+	if err != nil {
+		return nil, nil, fmt.Errorf("打开 JumpServer 登录入口失败：%w", err)
 	}
-	return f, nil
+	u, err := url.Parse(location)
+	if err != nil || u.Host == "" {
+		return nil, nil, fmt.Errorf("登录入口跳转目标无法解析：%s", location)
+	}
+	f.ssoBase = u.Scheme + "://" + u.Host
+	f.loginURL = location
+	f.service = u.Query().Get("service")
+	if f.service == "" {
+		return nil, nil, fmt.Errorf("登录入口未携带 service 参数（%s），环境配置异常", location)
+	}
+
+	if ssoCookie != "" {
+		f.seedCookies(f.ssoBase, ssoCookie)
+	}
+
+	outcome, err := f.openSSO(ctx)
+	if err != nil {
+		return nil, nil, err
+	}
+	return f, outcome, nil
 }
 
-// openLoginPage 拉取登录页：提取 csrf 令牌并探测加密方案 Cookie。
-func (f *LoginFlow) openLoginPage(ctx context.Context) error {
-	raw, resp, err := f.get(ctx, f.loginURL, "")
+// QR 返回当前扫码挑战（NeedQR 时有效）。
+func (f *LoginFlow) QR() *QRCode { return f.qr }
+
+// Service 返回本次登录的 service 参数（业务侧 CAS 回调地址）。
+func (f *LoginFlow) Service() string { return f.service }
+
+// RefreshQR 重新拉取二维码内容（同一扫码会话内刷新，令牌不变）。
+func (f *LoginFlow) RefreshQR(ctx context.Context) error {
+	if f.qr == nil {
+		return errors.New("当前没有待刷新的二维码")
+	}
+	return f.loadQR(ctx, f.qr.Token)
+}
+
+// openSSO 打开 SSO 登录页：会话仍有效时直接换票完成；否则解析页面拉取二维码。
+func (f *LoginFlow) openSSO(ctx context.Context) (*LoginOutcome, error) {
+	raw, resp, err := f.get(ctx, f.loginURL)
 	if err != nil {
-		return fmt.Errorf("打开登录页失败（网络不可达或服务异常）：%w", err)
+		return nil, fmt.Errorf("打开统一认证登录页失败（网络不可达或服务异常）：%w", err)
+	}
+	switch resp.StatusCode {
+	case http.StatusOK:
+		page := string(raw)
+		token := extractQRToken(page)
+		if token == "" {
+			return nil, errors.New("统一认证登录页未找到扫码令牌（页面结构变化？），请改用浏览器登录后复制 Cookie")
+		}
+		f.form = extractHiddenInputs(page)
+		if f.form.Get("execution") == "" {
+			return nil, errors.New("统一认证登录页未找到 CAS 执行上下文（execution 字段缺失，页面结构变化？）")
+		}
+		if err := f.loadQR(ctx, token); err != nil {
+			return nil, err
+		}
+		return &LoginOutcome{NeedQR: true, QR: f.qr}, nil
+	case http.StatusFound, http.StatusSeeOther, http.StatusTemporaryRedirect:
+		// SSO 会话有效：免扫码直接回 ticket
+		location := f.resolve(resp.Header.Get("Location"))
+		if !strings.Contains(location, "ticket=") {
+			return nil, fmt.Errorf("统一认证登录页跳转异常（%s）", location)
+		}
+		return f.acceptTicket(ctx, location)
+	default:
+		return nil, fmt.Errorf("打开统一认证登录页失败：HTTP %d", resp.StatusCode)
+	}
+}
+
+// loadQR 拉取二维码内容（content 为二维码承载的 URL，queryToken 用于轮询）。
+func (f *LoginFlow) loadQR(ctx context.Context, token string) error {
+	q := url.Values{}
+	q.Set("token", token)
+	q.Set("service", f.service)
+	raw, resp, err := f.get(ctx, f.ssoBase+ssoQRContentPath+"?"+q.Encode())
+	if err != nil {
+		return fmt.Errorf("获取登录二维码失败（网络不可达或服务异常）：%w", err)
 	}
 	if resp.StatusCode != http.StatusOK {
-		return fmt.Errorf("打开登录页失败：HTTP %d", resp.StatusCode)
+		return fmt.Errorf("获取登录二维码失败：HTTP %d", resp.StatusCode)
 	}
-	f.csrf = extractCSRF(string(raw))
-	if f.csrf == "" {
-		return errors.New("登录页未找到 csrf 令牌（页面结构变化？），请改用浏览器登录后复制 Cookie")
+	var body struct {
+		Status int `json:"status"`
+		Data   struct {
+			Content    string `json:"content"`
+			QueryToken struct {
+				Token   string `json:"token"`
+				Version int    `json:"version"`
+			} `json:"queryToken"`
+		} `json:"data"`
 	}
-	// 国密方案检测：实测环境不种 jms_gm_ssl；启用国密的环境需扩展 SM2/SM4 支持
-	if f.cookieValue("jms_gm_ssl") == "1" {
-		return &LoginError{Kind: LoginErrGMSSL, Msg: "该环境启用了国密（SM2/SM4）密码加密，当前版本不支持；请改用浏览器登录后复制 Cookie，或由维护者扩展国密支持"}
+	if err := json.Unmarshal(raw, &body); err != nil {
+		return fmt.Errorf("解析二维码响应失败：%w", err)
+	}
+	if body.Status != http.StatusOK || body.Data.Content == "" {
+		return fmt.Errorf("获取登录二维码失败：请稍后重试（服务端返回 %d）", body.Status)
+	}
+	f.qr = &QRCode{
+		Content: body.Data.Content,
+		Token:   body.Data.QueryToken.Token,
+		Version: body.Data.QueryToken.Version,
 	}
 	return nil
 }
 
-// SubmitCredentials 提交账号密码（密码按 session-encrypt.js 协议加密）。
-// 返回：NeedMFA=true 表示进入 2FA 挑战；否则登录完成，Cookie 可直接写入配置。
-func (f *LoginFlow) SubmitCredentials(ctx context.Context, username, password string) (*LoginOutcome, error) {
-	pubKey := f.cookieValue("jms_public_key")
-	if pubKey == "" {
-		return nil, errors.New("登录页未下发加密公钥（jms_public_key），无法加密密码；请改用浏览器登录后复制 Cookie")
+// PollScan 轮询一次扫码状态：done 非空表示换票完成，err 为致命错误；
+// 否则返回中间状态供 UI 提示。调用方按 scanPollInterval 节拍反复调用。
+func (f *LoginFlow) PollScan(ctx context.Context) (ScanStatus, *LoginOutcome, error) {
+	if f.qr == nil {
+		return ScanWaiting, nil, errors.New("当前没有待轮询的二维码")
 	}
-	enc, err := encryptPassword(pubKey, password)
+	q := url.Values{}
+	q.Set("token", f.qr.Token)
+	q.Set("version", fmt.Sprintf("%d", f.qr.Version))
+	f.qr.Version++
+	raw, resp, err := f.get(ctx, f.ssoBase+ssoScanCheckPath+"?"+q.Encode())
+	if err != nil || resp.StatusCode != http.StatusOK {
+		return ScanWaiting, nil, nil // 网络抖动：下一拍重试
+	}
+	var body struct {
+		Status int `json:"status"`
+		Data   *struct {
+			Status string `json:"status"`
+		} `json:"data"`
+	}
+	if err := json.Unmarshal(raw, &body); err != nil {
+		return ScanWaiting, nil, nil
+	}
+	if body.Status != http.StatusOK || body.Data == nil {
+		return ScanWaiting, nil, nil // 尚未扫码（服务端 data 为空）
+	}
+	switch body.Data.Status {
+	case "LOGINED":
+		outcome, err := f.completeScan(ctx)
+		return ScanScanned, outcome, err
+	case "LOGINING":
+		return ScanScanned, nil, nil
+	case "QUIT_LOGIN":
+		return ScanWaiting, nil, &LoginError{Kind: LoginErrScanCancelled, Msg: "微信侧已取消本次登录授权"}
+	case "ACCOUNT_BIND":
+		return ScanWaiting, nil, &LoginError{Kind: LoginErrAccountBind, Msg: "该微信尚未绑定统一认证账号，需先在浏览器完成一次绑定后再用本工具登录"}
+	case "EXPIRED":
+		return ScanWaiting, nil, &LoginError{Kind: LoginErrQRExpired, Msg: "二维码已过期"}
+	default:
+		return ScanWaiting, nil, nil
+	}
+}
+
+// completeScan 扫码完成后收尾：dologin 确认 →（隐私协议分支）→ CAS 表单换票。
+func (f *LoginFlow) completeScan(ctx context.Context) (*LoginOutcome, error) {
+	q := url.Values{}
+	q.Set("service", f.service)
+	raw, resp, err := f.get(ctx, f.ssoBase+ssoDoLoginPath+"?"+q.Encode())
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("确认扫码登录失败（网络不可达或服务异常）：%w", err)
 	}
-	form := url.Values{}
-	form.Set("csrfmiddlewaretoken", f.csrf)
-	form.Set("username", username)
-	form.Set("password", enc)
-	form.Set("auto_login", "on") // 等同浏览器勾选"记住我"，会话有效期更长
-	raw, resp, err := f.postForm(ctx, f.loginURL, form, f.loginURL)
-	if err != nil {
-		return nil, fmt.Errorf("提交登录失败（网络不可达或服务异常）：%w", err)
+	var body struct {
+		Status  int    `json:"status"`
+		Message string `json:"message"`
 	}
-	switch resp.StatusCode {
-	case http.StatusFound, http.StatusSeeOther, http.StatusTemporaryRedirect:
-		return f.followGuard(ctx, resp.Header.Get("Location"))
-	case http.StatusOK:
-		// 重渲染登录页：区分图形验证码（无法自动处理）与账号密码错误
-		if hasCaptchaField(string(raw)) {
-			return nil, &LoginError{Kind: LoginErrCaptcha, Msg: "登录连续失败触发图形验证码，程序内无法自动识别；请稍后重试，或改用浏览器登录后复制 Cookie"}
+	if err := json.Unmarshal(raw, &body); err != nil || resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("确认扫码登录失败：HTTP %d", resp.StatusCode)
+	}
+	if body.Status != http.StatusOK {
+		return nil, fmt.Errorf("确认扫码登录失败：%s", body.Message)
+	}
+	// 首次登录需同意隐私协议的账号：先提交同意标记，否则停在「扫码成功进不去」
+	if strings.Contains(body.Message, "同意") {
+		loginInfo := strings.SplitN(body.Message, "_", 2)[0]
+		form := url.Values{}
+		form.Set("loginInfo", loginInfo)
+		if _, resp, err := f.postForm(ctx, f.ssoBase+ssoActivatePath, form, f.loginURL); err != nil || resp.StatusCode >= 400 {
+			return nil, fmt.Errorf("提交隐私协议同意标记失败（HTTP %d）", resp.StatusCode)
 		}
-		return nil, &LoginError{Kind: LoginErrBadCredentials, Msg: "账号或密码错误：" + extractLoginError(string(raw))}
-	default:
-		return nil, fmt.Errorf("登录失败：HTTP %d", resp.StatusCode)
 	}
+
+	// CAS webflow：以扫码方式提交，换回 service?ticket=
+	form := url.Values{}
+	for k, v := range f.form {
+		form[k] = append([]string(nil), v...)
+	}
+	form.Set("_eventId", "scanCodeLogin")
+	raw, resp, err = f.postForm(ctx, f.loginURL, form, f.loginURL)
+	if err != nil {
+		return nil, fmt.Errorf("提交扫码结果失败（网络不可达或服务异常）：%w", err)
+	}
+	if resp.StatusCode < 300 || resp.StatusCode >= 400 {
+		return nil, fmt.Errorf("提交扫码结果失败：HTTP %d", resp.StatusCode)
+	}
+	location := f.resolve(resp.Header.Get("Location"))
+	if !strings.Contains(location, "ticket=") {
+		return nil, fmt.Errorf("统一认证未返回票据（跳转目标 %s），请重试或改用浏览器登录后复制 Cookie", location)
+	}
+	return f.acceptTicket(ctx, location)
 }
 
-// SubmitMFA 提交 2FA 动态验证码（code + mfa_type，取自 MFAPrompt）。
-// 成功后返回登录完成（Cookie 可写入配置）；验证码错误返回 LoginErrBadMFA。
-func (f *LoginFlow) SubmitMFA(ctx context.Context, code, mfaType string) (*LoginOutcome, error) {
-	if code == "" {
-		return nil, errors.New("MFA 验证码为空，已取消")
-	}
-	form := url.Values{}
-	form.Set("csrfmiddlewaretoken", f.csrf)
-	form.Set("code", code)
-	form.Set("mfa_type", mfaType)
-	raw, resp, err := f.postForm(ctx, f.mfaURL, form, f.mfaURL)
+// acceptTicket 带票据回跳业务侧，服务端校验后种会话 Cookie，再按业务侧
+// 分支（MFA / guard / 落地页）收尾。
+func (f *LoginFlow) acceptTicket(ctx context.Context, location string) (*LoginOutcome, error) {
+	_, resp, err := f.get(ctx, location)
 	if err != nil {
-		return nil, fmt.Errorf("提交 MFA 验证码失败（网络不可达或服务异常）：%w", err)
+		return nil, fmt.Errorf("回跳 JumpServer 失败（网络不可达或服务异常）：%w", err)
 	}
 	switch resp.StatusCode {
 	case http.StatusFound, http.StatusSeeOther, http.StatusTemporaryRedirect:
-		return f.followGuard(ctx, resp.Header.Get("Location"))
+		return f.followAfterAuth(ctx, f.resolve(resp.Header.Get("Location")))
 	case http.StatusOK:
-		return nil, &LoginError{Kind: LoginErrBadMFA, Msg: "JumpServer 2FA 动态验证码错误：" + extractLoginError(string(raw))}
+		return f.done()
 	default:
-		return nil, fmt.Errorf("MFA 校验失败：HTTP %d", resp.StatusCode)
+		return nil, fmt.Errorf("ticket 校验失败：HTTP %d（可能需要重新扫码）", resp.StatusCode)
 	}
 }
 
-// followGuard 沿 guard 302 链走到终态：直达业务首页则登录完成（提取 Cookie），
-// 跳 MFA 页则进入 2FA 挑战，跳第三方/扫码则返回 LoginErrThirdParty。
-// 302 链最多跟随 6 跳防死循环。
-func (f *LoginFlow) followGuard(ctx context.Context, location string) (*LoginOutcome, error) {
+// followAfterAuth 沿业务侧 302 链走到终态：MFA 页进入 2FA 挑战，guard
+// 继续跟随，回落到登录入口表示会话未建立，其余视为落地页并消费。
+func (f *LoginFlow) followAfterAuth(ctx context.Context, location string) (*LoginOutcome, error) {
 	for i := 0; i < 6; i++ {
 		switch {
 		case strings.Contains(location, loginMFAPath):
 			return f.enterMFA(ctx)
 		case strings.Contains(location, loginGuardPath):
-			_, resp, err := f.get(ctx, f.resolve(location), f.loginURL)
+			next, err := f.redirectTarget(ctx, location)
 			if err != nil {
 				return nil, fmt.Errorf("跟随登录跳转失败：%w", err)
 			}
-			if resp.StatusCode < 300 || resp.StatusCode >= 400 {
-				return nil, fmt.Errorf("登录跳转异常：HTTP %d（%s）", resp.StatusCode, location)
-			}
-			location = resp.Header.Get("Location")
-		case isThirdPartyPath(location):
-			return nil, &LoginError{Kind: LoginErrThirdParty, Msg: "该环境配置了扫码/第三方登录（企业微信/钉钉/飞书/OpenID/CAS/SAML2/OAuth2 等），程序内无法完成；请用浏览器登录后复制 Cookie，粘贴到配置文件"}
-		case strings.Contains(location, loginPath):
-			// 302 回登录页（如 guard 的 session_empty 分支）：会话未建立，登录实际失败
-			return nil, errors.New("登录跳转回登录页（会话未建立），可能因登录窗口过期；请重新运行 reedferry 再试")
+			location = next
+		case strings.HasPrefix(location, f.ssoBase), strings.Contains(location, loginPath):
+			return nil, errors.New("ticket 未被接受（回落到登录入口），会话未建立，请重新扫码")
 		default:
-			// 直达业务首页：登录完成，会话 Cookie 已由服务端种入 Jar
-			return &LoginOutcome{Cookie: f.serializeCookie()}, nil
+			return f.consumeLanding(ctx, location)
 		}
 	}
 	return nil, errors.New("登录跳转链异常（超过 6 次重定向），请改用浏览器登录后复制 Cookie")
 }
 
-// enterMFA 进入 2FA 挑战：拉取 MFA 页，收集 csrf 令牌与可用验证方式。
+// consumeLanding 取落地页：Django 系的 CSRF Cookie（jms_csrftoken）只在渲染
+// 带 CSRF 的页面时才种下，必须先消费页面再序列化 Cookie。
+func (f *LoginFlow) consumeLanding(ctx context.Context, location string) (*LoginOutcome, error) {
+	for i := 0; i < 4; i++ {
+		_, resp, err := f.get(ctx, location)
+		if err != nil {
+			// 落地页取不到不影响会话本身，按完成处理
+			return f.done()
+		}
+		if resp.StatusCode >= 300 && resp.StatusCode < 400 {
+			location = f.resolve(resp.Header.Get("Location"))
+			continue
+		}
+		break
+	}
+	return f.done()
+}
+
+// enterMFA 进入业务侧 2FA 挑战：拉取 MFA 页，收集可用验证方式。
 func (f *LoginFlow) enterMFA(ctx context.Context) (*LoginOutcome, error) {
-	raw, resp, err := f.get(ctx, f.mfaURL, f.loginURL)
+	raw, resp, err := f.get(ctx, f.mfaURL)
 	if err != nil {
 		return nil, fmt.Errorf("打开 MFA 页失败（网络不可达或服务异常）：%w", err)
 	}
@@ -266,20 +433,73 @@ func (f *LoginFlow) enterMFA(ctx context.Context) (*LoginOutcome, error) {
 		}
 		return nil, fmt.Errorf("打开 MFA 页失败：HTTP %d", resp.StatusCode)
 	}
-	f.csrf = extractCSRF(string(raw))
 	options := extractMFAOptions(string(raw))
 	if len(options) == 0 {
 		return nil, errors.New("MFA 页未解析到可用的验证方式（页面结构变化？），请改用浏览器登录后复制 Cookie")
 	}
+	f.form = extractHiddenInputs(string(raw))
 	return &LoginOutcome{NeedMFA: true, Prompt: &MFAPrompt{Options: options}}, nil
 }
 
+// SubmitMFA 提交业务侧 2FA 动态验证码（code + mfa_type，取自 MFAPrompt）。
+func (f *LoginFlow) SubmitMFA(ctx context.Context, code, mfaType string) (*LoginOutcome, error) {
+	if code == "" {
+		return nil, errors.New("MFA 验证码为空，已取消")
+	}
+	form := url.Values{}
+	form.Set("csrfmiddlewaretoken", f.form.Get("csrfmiddlewaretoken"))
+	form.Set("code", code)
+	form.Set("mfa_type", mfaType)
+	raw, resp, err := f.postForm(ctx, f.mfaURL, form, f.mfaURL)
+	if err != nil {
+		return nil, fmt.Errorf("提交 MFA 验证码失败（网络不可达或服务异常）：%w", err)
+	}
+	switch resp.StatusCode {
+	case http.StatusFound, http.StatusSeeOther, http.StatusTemporaryRedirect:
+		return f.followAfterAuth(ctx, f.resolve(resp.Header.Get("Location")))
+	case http.StatusOK:
+		return nil, &LoginError{Kind: LoginErrBadMFA, Msg: "JumpServer 2FA 动态验证码错误：" + extractLoginError(string(raw))}
+	default:
+		return nil, fmt.Errorf("MFA 校验失败：HTTP %d", resp.StatusCode)
+	}
+}
+
+// done 序列化两个域的会话 Cookie：业务域给 API/WS 用，SSO 域用于下次免扫码。
+func (f *LoginFlow) done() (*LoginOutcome, error) {
+	biz := f.serializeCookies(f.host)
+	if !strings.Contains(biz, "jms_sessionid=") {
+		return nil, errors.New("登录后未拿到业务会话 Cookie（jms_sessionid），请重试或改用浏览器登录后复制 Cookie")
+	}
+	return &LoginOutcome{Cookie: biz, SSOCookie: f.serializeCookies(f.ssoBase)}, nil
+}
+
+// ---------- HTTP 基础 ----------
+
 // get 执行 GET（禁自动重定向），完整读取响应体后返回。
-func (f *LoginFlow) get(ctx context.Context, u, referer string) ([]byte, *http.Response, error) {
+func (f *LoginFlow) get(ctx context.Context, u string) ([]byte, *http.Response, error) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u, nil)
 	if err != nil {
-		return nil, nil, fmt.Errorf("构造请求失败：%w", err)
+		return nil, nil, err
 	}
+	resp, err := f.http.Do(req)
+	if err != nil {
+		return nil, nil, err
+	}
+	defer resp.Body.Close()
+	raw, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, nil, err
+	}
+	return raw, resp, nil
+}
+
+// postForm 执行表单 POST（禁自动重定向），完整读取响应体后返回。
+func (f *LoginFlow) postForm(ctx context.Context, u string, form url.Values, referer string) ([]byte, *http.Response, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, u, strings.NewReader(form.Encode()))
+	if err != nil {
+		return nil, nil, err
+	}
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 	if referer != "" {
 		req.Header.Set("Referer", referer)
 	}
@@ -290,29 +510,21 @@ func (f *LoginFlow) get(ctx context.Context, u, referer string) ([]byte, *http.R
 	defer resp.Body.Close()
 	raw, err := io.ReadAll(resp.Body)
 	if err != nil {
-		return nil, nil, fmt.Errorf("读取响应失败：%w", err)
+		return nil, nil, err
 	}
 	return raw, resp, nil
 }
 
-// postForm 执行表单 POST（禁自动重定向），完整读取响应体后返回。
-func (f *LoginFlow) postForm(ctx context.Context, u string, form url.Values, referer string) ([]byte, *http.Response, error) {
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, u, strings.NewReader(form.Encode()))
+// redirectTarget 请求 u 并返回其 302 目标（绝对 URL）；非 302 视为异常。
+func (f *LoginFlow) redirectTarget(ctx context.Context, u string) (string, error) {
+	_, resp, err := f.get(ctx, u)
 	if err != nil {
-		return nil, nil, fmt.Errorf("构造请求失败：%w", err)
+		return "", err
 	}
-	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
-	req.Header.Set("Referer", referer)
-	resp, err := f.http.Do(req)
-	if err != nil {
-		return nil, nil, err
+	if resp.StatusCode < 300 || resp.StatusCode >= 400 {
+		return "", fmt.Errorf("期望跳转，实际 HTTP %d（%s）", resp.StatusCode, u)
 	}
-	defer resp.Body.Close()
-	raw, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return nil, nil, fmt.Errorf("读取响应失败：%w", err)
-	}
-	return raw, resp, nil
+	return f.resolve(resp.Header.Get("Location")), nil
 }
 
 // resolve 将（可能相对的）Location 解析为绝对 URL。
@@ -325,9 +537,31 @@ func (f *LoginFlow) resolve(location string) string {
 	return base.ResolveReference(u).String()
 }
 
-// serializeCookie 将 Jar 中的会话 Cookie 序列化为 "k=v; k2=v2" 配置串。
-func (f *LoginFlow) serializeCookie() string {
-	u, _ := url.Parse(f.loginURL)
+// seedCookies 把 "k=v; k2=v2" 形态的 Cookie 串灌入指定域的 Jar。
+func (f *LoginFlow) seedCookies(base, raw string) {
+	u, err := url.Parse(base)
+	if err != nil {
+		return
+	}
+	var cookies []*http.Cookie
+	for _, part := range strings.Split(raw, ";") {
+		k, v, ok := strings.Cut(strings.TrimSpace(part), "=")
+		if !ok || k == "" {
+			continue
+		}
+		cookies = append(cookies, &http.Cookie{Name: k, Value: v, Path: "/"})
+	}
+	if len(cookies) > 0 {
+		f.jar.SetCookies(u, cookies)
+	}
+}
+
+// serializeCookies 把指定域的 Cookie 序列化为 "k=v; k2=v2" 配置串。
+func (f *LoginFlow) serializeCookies(base string) string {
+	u, err := url.Parse(base + "/")
+	if err != nil {
+		return ""
+	}
 	parts := make([]string, 0, 8)
 	for _, c := range f.jar.Cookies(u) {
 		parts = append(parts, c.Name+"="+c.Value)
@@ -335,113 +569,41 @@ func (f *LoginFlow) serializeCookie() string {
 	return strings.Join(parts, "; ")
 }
 
-// cookieValue 返回 Jar 中指定名字的 Cookie 值（不存在返回空串）。
-func (f *LoginFlow) cookieValue(name string) string {
-	u, _ := url.Parse(f.loginURL)
-	for _, c := range f.jar.Cookies(u) {
-		if c.Name == name {
-			return c.Value
-		}
-	}
-	return ""
-}
-
-// ---------- 密码加密（与前端 session-encrypt.js / 后端 common/utils/crypto.py 对齐） ----------
-
-// encryptPassword 按前端逻辑加密密码：
-// 随机 AES key 经 AES/ECB/ZeroPadding 加密密码；AES key 用 RSA 公钥
-// （PKCS1 v1.5）加密；输出 "{rsaKeyCipher}:{aesPasswordCipher}"（均 base64）。
-func encryptPassword(publicKeyB64, password string) (string, error) {
-	pub, err := parseRSAPublicKey(publicKeyB64)
-	if err != nil {
-		return "", fmt.Errorf("解析登录页 RSA 公钥失败（%v）；请改用浏览器登录后复制 Cookie", err)
-	}
-	aesKey := randomAESKey() // 模拟前端 (Math.random()+1).toString(36).substring(2)
-	rsaCipher, err := rsa.EncryptPKCS1v15(rand.Reader, pub, []byte(aesKey))
-	if err != nil {
-		return "", fmt.Errorf("RSA 加密失败：%w", err)
-	}
-	aesCipher, err := aesECBZeroPadEncrypt(aesKey, password)
-	if err != nil {
-		return "", err
-	}
-	return base64.StdEncoding.EncodeToString(rsaCipher) + ":" + aesCipher, nil
-}
-
-// parseRSAPublicKey 解析 jms_public_key Cookie（base64(PEM)）为 RSA 公钥；
-// 兼容 PEM 与裸 DER（PKIX/SPKI）两种形态。
-func parseRSAPublicKey(b64 string) (*rsa.PublicKey, error) {
-	der, err := base64.StdEncoding.DecodeString(strings.Trim(b64, `"`))
-	if err != nil {
-		return nil, err
-	}
-	if block, _ := pem.Decode(der); block != nil {
-		der = block.Bytes
-	}
-	pub, err := x509.ParsePKIXPublicKey(der)
-	if err != nil {
-		return nil, err
-	}
-	rsaPub, ok := pub.(*rsa.PublicKey)
-	if !ok {
-		return nil, errors.New("公钥不是 RSA 公钥")
-	}
-	return rsaPub, nil
-}
-
-// randomAESKey 生成与前端等价形态的随机 AES key（10 位 base36，≤16 字节；
-// 后端 padding_key 会把 key 补零到块边界）。
-func randomAESKey() string {
-	const charset = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789"
-	b := make([]byte, 10)
-	for i := range b {
-		n, err := rand.Int(rand.Reader, big.NewInt(int64(len(charset))))
-		if err != nil {
-			panic(err) // crypto/rand 失败属系统级异常，程序无法继续
-		}
-		b[i] = charset[n.Int64()]
-	}
-	return string(b)
-}
-
-// aesECBZeroPadEncrypt 执行 AES/ECB + ZeroPadding（与前端 CryptoJS
-// mode:ECB, pad:ZeroPadding 及后端 AESCrypto.to_16 对齐：不足 16 倍数补零，
-// 整倍数不补块；输出标准 base64）。
-func aesECBZeroPadEncrypt(key, plain string) (string, error) {
-	keyBytes := make([]byte, 16) // 前端 fillKey：截断/补零到 16 字节
-	copy(keyBytes, key)
-	block, err := aes.NewCipher(keyBytes)
-	if err != nil {
-		return "", fmt.Errorf("AES 初始化失败：%w", err)
-	}
-	data := []byte(plain)
-	if n := len(data) % aes.BlockSize; n != 0 {
-		data = append(data, make([]byte, aes.BlockSize-n)...)
-	}
-	ciphertext := make([]byte, len(data))
-	for i := 0; i < len(data); i += aes.BlockSize {
-		block.Encrypt(ciphertext[i:i+aes.BlockSize], data[i:i+aes.BlockSize])
-	}
-	return base64.StdEncoding.EncodeToString(ciphertext), nil
-}
-
-// ---------- 页面解析（正则容错，页面结构见附录 D V5） ----------
+// ---------- 页面解析（正则容错，页面结构见设计文档附录 D V5） ----------
 
 var (
-	csrfTokenRe   = regexp.MustCompile(`name="csrfmiddlewaretoken"\s+value="([^"]+)"`)
-	mfaOptionRe   = regexp.MustCompile(`(?s)<option\s+value="([^"]+)"([^>]*)>(.*?)</option>`)
-	errorBlockRe  = regexp.MustCompile(`(?s)<p[^>]*class="[^"]*(?:red-fonts|error)[^"]*"[^>]*>(.*?)</p>`)
-	tagRe         = regexp.MustCompile(`<[^>]*>`)
-	thirdPartyKws = []string{"qr/login", "/openid/", "/cas/", "/saml2/", "/oauth2/"}
+	qrTokenRe    = regexp.MustCompile(`var\s+qrToken\s*=\s*"([^"]+)"`)
+	hiddenRe     = regexp.MustCompile(`(?is)<input[^>]*type="hidden"[^>]*>`)
+	nameAttrRe   = regexp.MustCompile(`(?is)name="([^"]*)"`)
+	valAttrRe    = regexp.MustCompile(`(?is)value="([^"]*)"`)
+	mfaOptionRe  = regexp.MustCompile(`(?s)<option\s+value="([^"]+)"([^>]*)>(.*?)</option>`)
+	errorBlockRe = regexp.MustCompile(`(?s)<p[^>]*class="[^"]*(?:red-fonts|error)[^"]*"[^>]*>(.*?)</p>`)
+	tagRe        = regexp.MustCompile(`<[^>]*>`)
 )
 
-// extractCSRF 提取页面中的 csrfmiddlewaretoken。
-func extractCSRF(html string) string {
-	m := csrfTokenRe.FindStringSubmatch(html)
-	if len(m) == 2 {
+// extractQRToken 提取 SSO 登录页内联脚本中的扫码令牌。
+func extractQRToken(html string) string {
+	if m := qrTokenRe.FindStringSubmatch(html); len(m) == 2 {
 		return m[1]
 	}
 	return ""
+}
+
+// extractHiddenInputs 收集页面全部 hidden 表单字段（CAS webflow 提交需原样带回）。
+func extractHiddenInputs(html string) url.Values {
+	form := url.Values{}
+	for _, tag := range hiddenRe.FindAllString(html, -1) {
+		n := nameAttrRe.FindStringSubmatch(tag)
+		if len(n) != 2 || n[1] == "" {
+			continue
+		}
+		v := ""
+		if m := valAttrRe.FindStringSubmatch(tag); len(m) == 2 {
+			v = m[1]
+		}
+		form.Set(n[1], v)
+	}
+	return form
 }
 
 // extractMFAOptions 解析 MFA 页 <select name="mfa_type"> 的可用验证方式
@@ -461,31 +623,12 @@ func extractMFAOptions(html string) []MFAOption {
 	return out
 }
 
-// extractLoginError 从重渲染的登录/MFA 页提取错误文案（.red-fonts 帮助块）。
+// extractLoginError 从重渲染的 MFA 页提取错误文案（.red-fonts 帮助块）。
 func extractLoginError(html string) string {
-	m := errorBlockRe.FindStringSubmatch(html)
-	if len(m) == 2 {
+	if m := errorBlockRe.FindStringSubmatch(html); len(m) == 2 {
 		if t := strings.TrimSpace(tagRe.ReplaceAllString(m[1], "")); t != "" {
 			return t
 		}
 	}
 	return "请检查输入后重试"
-}
-
-// hasCaptchaField 判断重渲染的登录页是否要求图形验证码（无法自动处理）。
-// 真实环境实测：验证码字段为 captcha_0（hidden key）+ captcha_1（文本输入），
-// 挑战码字段为 challenge（见附录 D V5）。
-func hasCaptchaField(html string) bool {
-	return strings.Contains(html, `name="captcha_0"`) || strings.Contains(html, `name="captcha"`) ||
-		strings.Contains(html, `name="challenge"`)
-}
-
-// isThirdPartyPath 判断跳转目标是否为扫码/第三方认证路径（无法纯 HTTP 完成）。
-func isThirdPartyPath(location string) bool {
-	for _, kw := range thirdPartyKws {
-		if strings.Contains(location, kw) {
-			return true
-		}
-	}
-	return false
 }

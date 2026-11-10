@@ -1,11 +1,15 @@
 package authui
 
 import (
+	"bytes"
+	"context"
 	"errors"
 	"io"
-	"os"
 	"strings"
 	"testing"
+	"time"
+
+	"reedferry/internal/jumpserver"
 )
 
 // HiddenReader：按序消费通道字节块拼成 io.Reader 流；通道关闭返回 io.EOF
@@ -95,42 +99,156 @@ func TestReadLineRawEOF(t *testing.T) {
 	}
 }
 
-// ReadCredentials：配置预填凭据时跳过账号/密码交互输入（不再消费通道）
-func TestReadCredentialsPresetSkipsInput(t *testing.T) {
-	ch := make(chan []byte, 1)
-	ch <- []byte("typo\n") // 若有任何交互读取，这里会读到该字节
-	hr := NewHiddenReader(ch, -1)
-	username, password, err := ReadCredentials(hr, io.Discard, Credentials{Username: "alice", Password: "s3cret"})
+// renderQRCode：输出含配色转义与半块字符，且图像按两行并一行字符缩写。
+func TestRenderQRCode(t *testing.T) {
+	art, err := renderQRCode("https://sso.example.com/login?key=abc&type=qrcode-login")
 	if err != nil {
-		t.Fatalf("ReadCredentials: %v", err)
+		t.Fatalf("renderQRCode: %v", err)
 	}
-	if username != "alice" || password != "s3cret" {
-		t.Errorf("preset credentials: got %q/%q", username, password)
+	if !strings.Contains(art, "\x1b[30;47m") || !strings.Contains(art, "\x1b[0m") {
+		t.Error("missing ANSI color codes (dark terminal would invert the code)")
+	}
+	if !strings.ContainsAny(art, "█▀▄") {
+		t.Error("no block characters rendered")
+	}
+	if strings.Count(art, "\n") < 10 {
+		t.Errorf("suspiciously few rows: %d", strings.Count(art, "\n"))
 	}
 }
 
-// ReadCredentials：预填只给账号时，密码仍需交互输入；账号空报错
-func TestReadCredentialsPartialPreset(t *testing.T) {
-	ch := make(chan []byte, 1)
-	ch <- []byte("pwd1\n")
-	f, err := os.OpenFile(os.DevNull, os.O_RDWR, 0)
-	if err != nil {
-		t.Fatal(err)
+// RenderQR 非终端输出：不写转义序列，改打印二维码内容 URL。
+func TestRenderQRFallbackNonTTY(t *testing.T) {
+	var buf bytes.Buffer
+	if err := RenderQR(&buf, "https://sso.example.com/login?key=abc"); err != nil {
+		t.Fatalf("RenderQR: %v", err)
 	}
-	defer f.Close()
-	hr := NewHiddenReader(ch, int(f.Fd()))
-	username, password, err := ReadCredentials(hr, io.Discard, Credentials{Username: "alice"})
-	if err != nil {
-		t.Fatalf("ReadCredentials: %v", err)
+	if !strings.Contains(buf.String(), "二维码内容：https://sso.example.com/login?key=abc") {
+		t.Errorf("fallback output: %q", buf.String())
 	}
-	if username != "alice" || password != "pwd1" {
-		t.Errorf("partial preset: got %q/%q", username, password)
+	if strings.Contains(buf.String(), "\x1b[") {
+		t.Error("ANSI escapes written to non-terminal output")
 	}
+}
 
-	ch2 := make(chan []byte)
-	close(ch2) // EOF：账号输入被取消
-	hr2 := NewHiddenReader(ch2, -1)
-	if _, _, err := ReadCredentials(hr2, io.Discard, Credentials{}); !errors.Is(err, io.EOF) {
-		t.Errorf("EOF on username: got %v, want io.EOF", err)
+// splitLines：按行拆分字节块，处理跨块行与 CR。
+func TestSplitLines(t *testing.T) {
+	ch := make(chan []byte, 3)
+	ch <- []byte("a")
+	ch <- []byte("b\r\nc\n")
+	ch <- []byte("d")
+	close(ch)
+	lines, stop := splitLines(ch)
+	defer stop()
+	var got []string
+	for line := range lines {
+		got = append(got, line)
+	}
+	want := []string{"ab", "c", "d"}
+	if len(got) != len(want) {
+		t.Fatalf("lines: %q", got)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Errorf("line[%d]: got %q want %q", i, got[i], want[i])
+		}
+	}
+}
+
+// stubFlow 模拟扫码流程：按队列返回轮询结果。
+type stubFlow struct {
+	qr        *jumpserver.QRCode
+	results   []stubResult
+	refresh   int
+	refreshed chan struct{}
+}
+
+type stubResult struct {
+	status  jumpserver.ScanStatus
+	outcome *jumpserver.LoginOutcome
+	err     error
+}
+
+func (s *stubFlow) QR() *jumpserver.QRCode { return s.qr }
+
+func (s *stubFlow) RefreshQR(context.Context) error {
+	s.refresh++
+	if s.refreshed != nil {
+		s.refreshed <- struct{}{}
+	}
+	return nil
+}
+
+func (s *stubFlow) PollScan(context.Context) (jumpserver.ScanStatus, *jumpserver.LoginOutcome, error) {
+	if len(s.results) == 0 {
+		return jumpserver.ScanWaiting, nil, nil
+	}
+	r := s.results[0]
+	if len(s.results) > 1 {
+		s.results = s.results[1:]
+	}
+	return r.status, r.outcome, r.err
+}
+
+func newStub(results ...stubResult) *stubFlow {
+	return &stubFlow{qr: &jumpserver.QRCode{Content: "https://sso.example.com/login?key=k", Token: "tok", Version: 1}, results: results}
+}
+
+// WaitScan：轮询到已扫码并完成，中间提示扫码状态。
+func TestWaitScanScannedThenDone(t *testing.T) {
+	old := pollInterval
+	pollInterval = 5 * time.Millisecond
+	defer func() { pollInterval = old }()
+
+	final := &jumpserver.LoginOutcome{Cookie: "jms_sessionid=x"}
+	flow := newStub(
+		stubResult{status: jumpserver.ScanScanned},
+		stubResult{status: jumpserver.ScanScanned, outcome: final},
+	)
+	var out bytes.Buffer
+	got, err := WaitScan(context.Background(), flow, make(chan []byte), &out)
+	if err != nil {
+		t.Fatalf("WaitScan: %v", err)
+	}
+	if got == nil || got.Cookie != "jms_sessionid=x" {
+		t.Errorf("outcome: %+v", got)
+	}
+	if !strings.Contains(out.String(), "已扫码") {
+		t.Errorf("missing scanned hint: %q", out.String())
+	}
+}
+
+// WaitScan：输入 q 取消登录（返回 ErrCancelled）。
+func TestWaitScanCancel(t *testing.T) {
+	ch := make(chan []byte, 1)
+	ch <- []byte("q\n")
+	if _, err := WaitScan(context.Background(), newStub(), ch, io.Discard); !errors.Is(err, ErrCancelled) {
+		t.Errorf("want ErrCancelled, got %v", err)
+	}
+}
+
+// WaitScan：二维码过期时自动刷新并继续等待。
+func TestWaitScanRefreshesOnExpired(t *testing.T) {
+	old := pollInterval
+	pollInterval = 5 * time.Millisecond
+	defer func() { pollInterval = old }()
+
+	final := &jumpserver.LoginOutcome{Cookie: "jms_sessionid=x"}
+	flow := newStub(
+		stubResult{err: &jumpserver.LoginError{Kind: jumpserver.LoginErrQRExpired, Msg: "二维码已过期"}},
+		stubResult{outcome: final},
+	)
+	var out bytes.Buffer
+	got, err := WaitScan(context.Background(), flow, make(chan []byte), &out)
+	if err != nil {
+		t.Fatalf("WaitScan: %v", err)
+	}
+	if got != final {
+		t.Errorf("outcome: %+v", got)
+	}
+	if flow.refresh != 1 {
+		t.Errorf("refresh calls: %d", flow.refresh)
+	}
+	if !strings.Contains(out.String(), "已过期") {
+		t.Errorf("missing expired hint: %q", out.String())
 	}
 }
