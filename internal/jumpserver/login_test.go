@@ -101,6 +101,7 @@ type fakeSSO struct {
 	statuses     []string // 依次返回的扫码状态，用尽后返回最后一项
 	silent       bool     // /login 直接回 ticket（SSO 会话有效）
 	dologinMsg   string
+	dologinFail  int // 前 N 次 dologin 返回「未就绪」（已扫码但微信侧尚未完成）
 	ticket       string
 	activations  []string
 }
@@ -171,7 +172,15 @@ func newFakeSSO(t *testing.T, business string) *fakeSSO {
 	mux.HandleFunc("/user/wechat-applet/dologin", func(w http.ResponseWriter, r *http.Request) {
 		f.mu.Lock()
 		msg := f.dologinMsg
+		fail := f.dologinFail > 0
+		if fail {
+			f.dologinFail--
+		}
 		f.mu.Unlock()
+		if fail {
+			_ = json.NewEncoder(w).Encode(map[string]any{"status": 400, "message": "二维码已失效，请扫码重试。"})
+			return
+		}
 		_ = json.NewEncoder(w).Encode(map[string]any{"status": 200, "message": msg})
 	})
 	mux.HandleFunc("/user/set-activate-flag", func(w http.ResponseWriter, r *http.Request) {
@@ -299,6 +308,9 @@ func pollUntilDone(t *testing.T, flow *LoginFlow) *LoginOutcome {
 
 func TestLoginQRSuccess(t *testing.T) {
 	biz, sso := fixture(t)
+	sso.mu.Lock()
+	sso.dologinFail = 1 // 第一拍（LOGINING）收尾未就绪，第二拍（LOGINED）成功
+	sso.mu.Unlock()
 	flow, outcome, err := NewLoginFlow(context.Background(), biz.server.URL, "")
 	if err != nil {
 		t.Fatalf("NewLoginFlow: %v", err)
@@ -384,6 +396,28 @@ func TestLoginMFA(t *testing.T) {
 	}
 	if !strings.Contains(final.Cookie, "mfa_done=1") || !strings.Contains(final.Cookie, "jms_sessionid=sess-good") {
 		t.Errorf("final cookie: %q", final.Cookie)
+	}
+}
+
+// 微信侧扫码即完成授权时，扫码状态可能停在 LOGINING 不推进到 LOGINED：
+// 已扫码后应主动尝试收尾（dologin），而不是死等 LOGINED。
+func TestLoginCompleteWhileStatusStuckLogining(t *testing.T) {
+	biz, sso := fixture(t)
+	sso.setStatuses("LOGINING") // 永远停在「已扫码」
+	sso.mu.Lock()
+	sso.dologinFail = 1 // 首次收尾未就绪，下一拍成功
+	sso.mu.Unlock()
+
+	flow, outcome, err := NewLoginFlow(context.Background(), biz.server.URL, "")
+	if err != nil {
+		t.Fatalf("NewLoginFlow: %v", err)
+	}
+	if !outcome.NeedQR {
+		t.Fatalf("want QR, got %+v", outcome)
+	}
+	final := pollUntilDone(t, flow)
+	if !strings.Contains(final.Cookie, "jms_sessionid=sess-good") {
+		t.Errorf("cookie: %q", final.Cookie)
 	}
 }
 

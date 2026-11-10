@@ -131,6 +131,10 @@ type LoginOutcome struct {
 	Prompt    *MFAPrompt // NeedMFA 时的挑战信息
 }
 
+// errScanNotReady 表示 dologin 尚未就绪（微信侧还没完成授权）：不是致命错误，
+// 继续轮询即可。
+var errScanNotReady = errors.New("扫码尚未完成")
+
 // ScanStatus 是扫码轮询的中间状态（用于给用户显示进度）。
 type ScanStatus int
 
@@ -156,6 +160,12 @@ type LoginFlow struct {
 
 	form url.Values // 当前页 hidden 表单字段（CAS webflow / MFA 提交用）
 	qr   *QRCode
+
+	// scanCompletes / scanPolls 记录「已扫码」后主动尝试收尾的次数与轮询拍数：
+	// 微信侧若在扫码时即完成授权，状态可能停在 LOGINING 不推进到 LOGINED，
+	// 不能只等状态，需按节拍主动试 dologin。
+	scanCompletes int
+	scanPolls     int
 }
 
 // NewLoginFlow 打开登录链路，推进到「待扫码」或「已完成」为止。
@@ -319,13 +329,31 @@ func (f *LoginFlow) PollScan(ctx context.Context) (ScanStatus, *LoginOutcome, er
 		return ScanWaiting, nil, nil
 	}
 	if body.Status != http.StatusOK || body.Data == nil {
+		traceStatus("null")
 		return ScanWaiting, nil, nil // 尚未扫码（服务端 data 为空）
 	}
+	traceStatus(body.Data.Status)
 	switch body.Data.Status {
 	case "LOGINED":
 		outcome, err := f.completeScan(ctx)
+		if errors.Is(err, errScanNotReady) {
+			return ScanScanned, nil, nil
+		}
 		return ScanScanned, outcome, err
 	case "LOGINING":
+		// 已扫码：微信侧自动授权时状态可能不再推进，主动尝试收尾。前两次每拍都
+		// 试，之后每 5 拍试一次，避免反复打 dologin。
+		f.scanPolls++
+		if f.scanCompletes < 2 || f.scanPolls%5 == 0 {
+			f.scanCompletes++
+			outcome, err := f.completeScan(ctx)
+			if err == nil {
+				return ScanScanned, outcome, nil
+			}
+			if !errors.Is(err, errScanNotReady) {
+				return ScanScanned, nil, err
+			}
+		}
 		return ScanScanned, nil, nil
 	case "QUIT_LOGIN":
 		return ScanWaiting, nil, &LoginError{Kind: LoginErrScanCancelled, Msg: "微信侧已取消本次登录授权"}
@@ -354,7 +382,7 @@ func (f *LoginFlow) completeScan(ctx context.Context) (*LoginOutcome, error) {
 		return nil, fmt.Errorf("确认扫码登录失败：HTTP %d", resp.StatusCode)
 	}
 	if body.Status != http.StatusOK {
-		return nil, fmt.Errorf("确认扫码登录失败：%s", body.Message)
+		return nil, fmt.Errorf("%w：%s", errScanNotReady, body.Message)
 	}
 	// 首次登录需同意隐私协议的账号：先提交同意标记，否则停在「扫码成功进不去」
 	if strings.Contains(body.Message, "同意") {
@@ -556,6 +584,13 @@ func trace(method string, u *url.URL, resp *http.Response) {
 	fmt.Fprintln(w)
 	for _, c := range resp.Cookies() {
 		fmt.Fprintf(w, "[login]   set-cookie %s len=%d path=%s domain=%s\n", c.Name, len(c.Value), c.Path, c.Domain)
+	}
+}
+
+// traceStatus 记录扫码状态（调试用）。
+func traceStatus(status string) {
+	if w := debugWriter(); w != nil {
+		fmt.Fprintf(w, "[login]   scan-status=%s\n", status)
 	}
 }
 
