@@ -203,6 +203,8 @@ type fakeBiz struct {
 	t          *testing.T
 	server     *httptest.Server
 	requireMFA bool
+	// anonymousSession 模拟「ticket 未被业务侧接受」：CAS 回跳后种的是匿名会话
+	anonymousSession bool
 }
 
 func newFakeBiz(t *testing.T, ssoURL func(service string) string) *fakeBiz {
@@ -221,7 +223,11 @@ func newFakeBiz(t *testing.T, ssoURL func(service string) string) *fakeBiz {
 			http.Redirect(w, r, "/", http.StatusFound)
 			return
 		}
-		http.SetCookie(w, &http.Cookie{Name: "jms_sessionid", Value: "sess-good", Path: "/"})
+		sess := "sess-good"
+		if b.anonymousSession {
+			sess = "anon"
+		}
+		http.SetCookie(w, &http.Cookie{Name: "jms_sessionid", Value: sess, Path: "/"})
 		http.Redirect(w, r, "/core/auth/login/guard/", http.StatusFound)
 	})
 	mux.HandleFunc("/core/auth/login/guard/", func(w http.ResponseWriter, r *http.Request) {
@@ -245,6 +251,14 @@ func newFakeBiz(t *testing.T, ssoURL func(service string) string) *fakeBiz {
 			return
 		}
 		_, _ = w.Write([]byte(`<p class="help-block red-fonts">验证码错误</p>`))
+	})
+	mux.HandleFunc("/api/v1/perms/users/self/nodes/children-with-assets/tree/", func(w http.ResponseWriter, r *http.Request) {
+		if c, err := r.Cookie("jms_sessionid"); err != nil || c.Value != "sess-good" {
+			w.WriteHeader(http.StatusUnauthorized)
+			_, _ = w.Write([]byte(`{"detail":"not authenticated"}`))
+			return
+		}
+		_, _ = w.Write([]byte("[]"))
 	})
 	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 		// 首页渲染带 CSRF 的页面：Django 在此种下 jms_csrftoken
@@ -466,6 +480,34 @@ func TestSerializeCookiesPerDomain(t *testing.T) {
 	if !strings.Contains(sso, "ssoid=c") || strings.Contains(sso, "jms_sessionid") {
 		t.Errorf("sso cookie: %q", sso)
 	}
+}
+
+// 业务侧未接受 ticket（会话仍是匿名）：不能当作登录成功，且错误要指出会话不可用。
+func TestLoginRejectsAnonymousSession(t *testing.T) {
+	biz, _ := fixture(t)
+	biz.anonymousSession = true
+
+	flow, outcome, err := NewLoginFlow(context.Background(), biz.server.URL, "")
+	if err != nil {
+		t.Fatalf("NewLoginFlow: %v", err)
+	}
+	if !outcome.NeedQR {
+		t.Fatalf("want QR, got %+v", outcome)
+	}
+	for i := 0; i < 20; i++ {
+		_, res, perr := flow.PollScan(context.Background())
+		if perr == nil && res == nil {
+			continue
+		}
+		if perr == nil {
+			t.Fatalf("匿名会话被判为登录成功: %+v", res)
+		}
+		if !strings.Contains(perr.Error(), "会话不可用") {
+			t.Fatalf("want session-unusable error, got %v", perr)
+		}
+		return
+	}
+	t.Fatal("polling did not finish")
 }
 
 func TestLoginNetworkError(t *testing.T) {

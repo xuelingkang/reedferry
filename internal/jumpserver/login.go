@@ -40,9 +40,26 @@ const (
 	ssoActivatePath  = "/user/set-activate-flag"
 )
 
-// loginDebug 打开后把登录链路的每一跳（方法、脱敏 URL、状态码、跳转目标、
-// 下发的 Cookie 名）打印到 stderr，用于排查 SSO 侧改版；默认关闭。
-var loginDebug = os.Getenv("REEDFERRY_LOGIN_DEBUG") != ""
+// loginDebugTarget 控制登录链路追踪的落点：未设为关闭；"1" 打印到 stderr；
+// 其他值视为文件路径（追加写）。每跳记录方法、脱敏 URL、状态码、跳转目标
+// 与下发的 Cookie 名，用于排查 SSO 侧改版。
+var loginDebugTarget = os.Getenv("REEDFERRY_LOGIN_DEBUG")
+
+// debugWriter 返回追踪输出目标（nil 表示关闭）。
+func debugWriter() io.Writer {
+	switch loginDebugTarget {
+	case "":
+		return nil
+	case "1":
+		return os.Stderr
+	default:
+		f, err := os.OpenFile(loginDebugTarget, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0600)
+		if err != nil {
+			return nil
+		}
+		return f
+	}
+}
 
 // LoginErrorKind 登录失败分类，CLI 层据此给出针对性提示。
 type LoginErrorKind int
@@ -380,7 +397,7 @@ func (f *LoginFlow) acceptTicket(ctx context.Context, location string) (*LoginOu
 	case http.StatusFound, http.StatusSeeOther, http.StatusTemporaryRedirect:
 		return f.followAfterAuth(ctx, f.resolve(resp.Header.Get("Location")))
 	case http.StatusOK:
-		return f.done()
+		return f.done(ctx)
 	default:
 		return nil, fmt.Errorf("ticket 校验失败：HTTP %d（可能需要重新扫码）", resp.StatusCode)
 	}
@@ -414,8 +431,8 @@ func (f *LoginFlow) consumeLanding(ctx context.Context, location string) (*Login
 	for i := 0; i < 4; i++ {
 		_, resp, err := f.get(ctx, location)
 		if err != nil {
-			// 落地页取不到不影响会话本身，按完成处理
-			return f.done()
+			// 落地页取不到不影响会话本身，按完成处理（会话有效性在 done 里校验）
+			return f.done(ctx)
 		}
 		if resp.StatusCode >= 300 && resp.StatusCode < 400 {
 			location = f.resolve(resp.Header.Get("Location"))
@@ -423,7 +440,7 @@ func (f *LoginFlow) consumeLanding(ctx context.Context, location string) (*Login
 		}
 		break
 	}
-	return f.done()
+	return f.done(ctx)
 }
 
 // enterMFA 进入业务侧 2FA 挑战：拉取 MFA 页，收集可用验证方式。
@@ -469,11 +486,15 @@ func (f *LoginFlow) SubmitMFA(ctx context.Context, code, mfaType string) (*Login
 	}
 }
 
-// done 序列化两个域的会话 Cookie：业务域给 API/WS 用，SSO 域用于下次免扫码。
-func (f *LoginFlow) done() (*LoginOutcome, error) {
+// done 序列化两个域的会话 Cookie，并立即用业务接口校验会话确实可用：
+// 匿名会话同样带 jms_sessionid，只看字段存在会把「ticket 未被接受」误判为成功。
+func (f *LoginFlow) done(ctx context.Context) (*LoginOutcome, error) {
 	biz := f.serializeCookies(f.host)
 	if !strings.Contains(biz, "jms_sessionid=") {
 		return nil, fmt.Errorf("登录后未拿到业务会话 Cookie（jms_sessionid），实际字段：%s", cookieNames(biz))
+	}
+	if code, err := VerifySession(ctx, f.host, biz); err != nil || code != http.StatusOK {
+		return nil, fmt.Errorf("登录后会话不可用（HTTP %d，字段：%s）：ticket 未被业务侧接受，请重试或改用浏览器登录后复制 Cookie", code, cookieNames(biz))
 	}
 	return &LoginOutcome{Cookie: biz, SSOCookie: f.serializeCookies(f.ssoBase)}, nil
 }
@@ -524,16 +545,17 @@ func (f *LoginFlow) postForm(ctx context.Context, u string, form url.Values, ref
 
 // trace 打印一次 HTTP 跳转摘要（URL 中票据/令牌类参数值脱敏）。
 func trace(method string, u *url.URL, resp *http.Response) {
-	if !loginDebug || resp == nil {
+	w := debugWriter()
+	if w == nil || resp == nil {
 		return
 	}
-	fmt.Fprintf(os.Stderr, "[login] %s %s -> %d", method, safeURL(u), resp.StatusCode)
+	fmt.Fprintf(w, "[login] %s %s -> %d", method, safeURL(u), resp.StatusCode)
 	if loc := resp.Header.Get("Location"); loc != "" {
-		fmt.Fprintf(os.Stderr, " location=%s", loc)
+		fmt.Fprintf(w, " location=%s", loc)
 	}
-	fmt.Fprintln(os.Stderr)
+	fmt.Fprintln(w)
 	for _, c := range resp.Cookies() {
-		fmt.Fprintf(os.Stderr, "[login]   set-cookie %s len=%d path=%s domain=%s\n", c.Name, len(c.Value), c.Path, c.Domain)
+		fmt.Fprintf(w, "[login]   set-cookie %s len=%d path=%s domain=%s\n", c.Name, len(c.Value), c.Path, c.Domain)
 	}
 }
 

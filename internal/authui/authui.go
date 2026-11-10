@@ -103,7 +103,9 @@ func (r *HiddenReader) prompt(out io.Writer, text string, secret bool) (string, 
 // 配色，避免深色终端把二维码反色导致识别不到）。非交互输出（非字符设备）
 // 只打印内容 URL，供用户自行在二维码生成器中使用。
 func RenderQR(w io.Writer, content string) error {
-	if !isCharDevice(w) {
+	// 字符设备之外的管道（如 `| tee log`）同样是人在看：TERM 有值就照常画，
+	// 只有真正脱离终端（cron/重定向且无 TERM）才退化为打印 URL。
+	if !isCharDevice(w) && os.Getenv("TERM") == "" {
 		fmt.Fprintf(w, "登录二维码内容：%s\n", content)
 		return nil
 	}
