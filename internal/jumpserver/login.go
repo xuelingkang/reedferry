@@ -415,7 +415,7 @@ func (f *LoginFlow) completeScan(ctx context.Context) (*LoginOutcome, error) {
 		return nil, fmt.Errorf("提交扫码结果失败（网络不可达或服务异常）：%w", err)
 	}
 	if resp.StatusCode < 300 || resp.StatusCode >= 400 {
-		return nil, fmt.Errorf("提交扫码结果失败：HTTP %d（页面可能已过期，请按 r 刷新二维码重试）", resp.StatusCode)
+		return nil, fmt.Errorf("提交扫码结果失败：HTTP %d%s（页面可能已过期，请按 r 刷新二维码重试）", resp.StatusCode, pageError(string(raw)))
 	}
 	location := f.resolve(resp.Header.Get("Location"))
 	if !strings.Contains(location, "ticket=") {
@@ -765,6 +765,16 @@ func extractMFAOptions(html string) []MFAOption {
 		out = append(out, MFAOption{Type: m[1], Label: label})
 	}
 	return out
+}
+
+// pageError 从重渲染页面提取错误文案（无则返回空串）。
+func pageError(html string) string {
+	if strings.Contains(html, "red-fonts") || strings.Contains(html, "error") {
+		if msg := extractLoginError(html); msg != "请检查输入后重试" {
+			return "：" + msg
+		}
+	}
+	return ""
 }
 
 // extractLoginError 从重渲染的 MFA 页提取错误文案（.red-fonts 帮助块）。
