@@ -414,9 +414,10 @@ func (f *LoginFlow) completeScan(ctx context.Context) (*LoginOutcome, error) {
 		if strings.Contains(location, "ticket=") {
 			return f.acceptTicket(ctx, location)
 		}
-	} else {
-		dumpFailure("cas-post", raw)
+		// 302 但不带 ticket：多为 CAS 把流程推到下一步（协议/组织/再次登录）
+		return nil, fmt.Errorf("提交扫码结果后跳转到 %s，未携带 ticket（可能需要额外确认步骤）", location)
 	}
+	dumpFailure("cas-post", raw)
 
 	// 兜底：会话若已认证，重新请求登录页会直接 302 回 ticket
 	if outcome, ok, err := f.exchangeViaGet(ctx); err != nil {
