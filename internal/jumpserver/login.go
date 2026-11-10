@@ -415,7 +415,7 @@ func (f *LoginFlow) completeScan(ctx context.Context) (*LoginOutcome, error) {
 		return nil, fmt.Errorf("提交扫码结果失败（网络不可达或服务异常）：%w", err)
 	}
 	if resp.StatusCode < 300 || resp.StatusCode >= 400 {
-		return nil, fmt.Errorf("提交扫码结果失败：HTTP %d%s（页面可能已过期，请按 r 刷新二维码重试）", resp.StatusCode, pageError(string(raw)))
+		return nil, fmt.Errorf("提交扫码结果失败：HTTP %d：%s", resp.StatusCode, dumpFailure("cas-post", raw))
 	}
 	location := f.resolve(resp.Header.Get("Location"))
 	if !strings.Contains(location, "ticket=") {
@@ -588,8 +588,12 @@ func (f *LoginFlow) postForm(ctx context.Context, u string, form url.Values, ref
 		return nil, nil, err
 	}
 	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	req.Header.Set("Accept", "text/html,application/xhtml+xml")
 	if referer != "" {
 		req.Header.Set("Referer", referer)
+		if u, err := url.Parse(referer); err == nil && u.Host != "" {
+			req.Header.Set("Origin", u.Scheme+"://"+u.Host)
+		}
 	}
 	resp, err := f.http.Do(req)
 	if err != nil {
@@ -723,6 +727,7 @@ var (
 	mfaOptionRe  = regexp.MustCompile(`(?s)<option\s+value="([^"]+)"([^>]*)>(.*?)</option>`)
 	errorBlockRe = regexp.MustCompile(`(?s)<p[^>]*class="[^"]*(?:red-fonts|error)[^"]*"[^>]*>(.*?)</p>`)
 	tagRe        = regexp.MustCompile(`<[^>]*>`)
+	titleRe      = regexp.MustCompile(`(?is)<title[^>]*>(.*?)</title>`)
 )
 
 // extractQRToken 提取 SSO 登录页内联脚本中的扫码令牌。
@@ -765,6 +770,47 @@ func extractMFAOptions(html string) []MFAOption {
 		out = append(out, MFAOption{Type: m[1], Label: label})
 	}
 	return out
+}
+
+// dumpFailure 把失败响应落盘并返回一段摘要（标题 + 命中关键字的文案），
+// 供排查 SSO 侧拒绝收尾的具体原因。
+func dumpFailure(tag string, raw []byte) string {
+	path := os.Getenv("REEDFERRY_LOGIN_DUMP")
+	if path == "" {
+		path = "/tmp/reedferry-login-fail.html"
+	}
+	_ = os.WriteFile(path, raw, 0600)
+	html := string(raw)
+	summary := ""
+	if m := titleRe.FindStringSubmatch(html); len(m) == 2 {
+		summary = "标题「" + strings.TrimSpace(m[1]) + "」"
+	}
+	if msg := extractLoginError(html); msg != "请检查输入后重试" {
+		summary += " 提示「" + msg + "」"
+	}
+	for _, kw := range []string{"失效", "过期", "错误", "失败", "重新"} {
+		i := strings.Index(html, kw)
+		if i < 0 {
+			continue
+		}
+		start := i - 60
+		if start < 0 {
+			start = 0
+		}
+		end := i + 60
+		if end > len(html) {
+			end = len(html)
+		}
+		frag := strings.TrimSpace(tagRe.ReplaceAllString(html[start:end], " "))
+		if frag != "" {
+			summary += " 片段「" + frag + "」"
+			break
+		}
+	}
+	if summary == "" {
+		summary = "响应中未找到错误文案"
+	}
+	return strings.Join([]string{strings.TrimSpace(summary), "完整响应已写入 " + path}, "；")
 }
 
 // pageError 从重渲染页面提取错误文案（无则返回空串）。
