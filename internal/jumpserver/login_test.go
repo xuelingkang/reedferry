@@ -75,6 +75,10 @@ func TestExtractLoginError(t *testing.T) {
 // ---------- 登录流程（httptest 模拟 JumpServer + sso.zxxk.com，见设计文档附录 D V5） ----------
 
 const ssoPage = `<!DOCTYPE html><html><body>
+<form id="phoneForm" action="" method="post">
+	<input type="hidden" name="mobile" value=""/>
+	<input type="hidden" name="execution" value="phone-exec"/>
+</form>
 <form id="redirectForm" action="" method="post">
 	<input type="hidden" name="execution" value="exec-1"/>
 	<input type="hidden" name="flowId" value="flow-1"/>
@@ -104,6 +108,7 @@ type fakeSSO struct {
 	dologinFail  int  // 前 N 次 dologin 返回「未就绪」（已扫码但微信侧尚未完成）
 	dologinOK    bool // dologin 是否已成功（成功后 SSO 会话即认证）
 	ticketViaGet bool // dologin 成功后 GET 登录页直接回 ticket（真实环境行为）
+	postRejects  bool // 表单提交被拒（CAS 重渲染登录页，HTTP 200）
 	ticket       string
 	activations  []string
 	postCalls    int // CAS webflow 表单提交次数
@@ -140,6 +145,16 @@ func newFakeSSO(t *testing.T, business string) *fakeSSO {
 		}
 		if got := r.Form.Get("execution"); got != "exec-1" {
 			t.Errorf("CAS form execution: got %q", got)
+		}
+		if r.Form.Has("mobile") || r.Form.Has("methodType") || r.Form.Has("rememberMe") {
+			t.Errorf("跨表单字段混入: %v", r.Form)
+		}
+		f.mu.Lock()
+		reject := f.postRejects
+		f.mu.Unlock()
+		if reject {
+			_, _ = w.Write([]byte(ssoPage))
+			return
 		}
 		http.Redirect(w, r, f.business+"/core/auth/cas/login/?ticket="+f.ticket, http.StatusFound)
 	})
@@ -356,9 +371,9 @@ func TestLoginQRSuccess(t *testing.T) {
 	if got := sso.pollVersions; len(got) != 2 || got[0] != "1" || got[1] != "2" {
 		t.Errorf("poll versions: %v", got)
 	}
-	// 会话认证后应走 GET 换票，不再提交可能已过期的 webflow 表单
-	if got := sso.postCalls; got != 0 {
-		t.Errorf("CAS form posted %d times, want 0", got)
+	// 与真机一致：dologin 成功后提交 redirectForm 换票
+	if got := sso.postCalls; got != 1 {
+		t.Errorf("CAS form posted %d times, want 1", got)
 	}
 }
 
@@ -442,11 +457,11 @@ func TestLoginCompleteWhileStatusStuckLogining(t *testing.T) {
 	}
 }
 
-// 会话认证后 GET 仍渲染登录页的环境：回落到 webflow 表单提交拿 ticket。
-func TestLoginFallbackFormPost(t *testing.T) {
+// 表单提交被 CAS 拒绝（重渲染 200）时，靠已认证的会话 GET 登录页换票。
+func TestLoginFallbackToGet(t *testing.T) {
 	biz, sso := fixture(t)
 	sso.mu.Lock()
-	sso.ticketViaGet = false
+	sso.postRejects = true
 	sso.mu.Unlock()
 
 	flow, outcome, err := NewLoginFlow(context.Background(), biz.server.URL, "")
@@ -464,7 +479,18 @@ func TestLoginFallbackFormPost(t *testing.T) {
 	posts := sso.postCalls
 	sso.mu.Unlock()
 	if posts == 0 {
-		t.Error("expected CAS form fallback to be used")
+		t.Error("expected form post to be attempted first")
+	}
+}
+
+// 只取 redirectForm 内的字段，不混入同页其它表单（手机验证码表单）。
+func TestExtractFormFields(t *testing.T) {
+	form := formFields(ssoPage)
+	if form.Get("execution") != "exec-1" {
+		t.Errorf("execution: %q", form.Get("execution"))
+	}
+	if form.Has("mobile") {
+		t.Errorf("混入了其它表单字段: %v", form)
 	}
 }
 

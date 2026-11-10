@@ -33,6 +33,10 @@ const (
 	loginGuardPath = "/core/auth/login/guard/"
 	loginMFAPath   = "/core/auth/login/mfa/"
 
+	// redirectFormID 是 SSO 登录页上扫码换票用的表单（真机实测其提交体只有
+	// execution / flowId / _eventId 三个字段）。
+	redirectFormID = "redirectForm"
+
 	// SSO 扫码端点（sso.zxxk.com 前端 scan-code-*.js 实测）。
 	ssoQRContentPath = "/user/qrcode/qrcode-login/v2/content"
 	ssoScanCheckPath = "/user/wechat-applet/logincheck"
@@ -249,7 +253,7 @@ func (f *LoginFlow) openSSO(ctx context.Context) (*LoginOutcome, error) {
 		if token == "" {
 			return nil, errors.New("统一认证登录页未找到扫码令牌（页面结构变化？），请改用浏览器登录后复制 Cookie")
 		}
-		f.form = extractHiddenInputs(page)
+		f.form = formFields(page)
 		if f.form.Get("execution") == "" {
 			return nil, errors.New("统一认证登录页未找到 CAS 执行上下文（execution 字段缺失，页面结构变化？）")
 		}
@@ -394,17 +398,8 @@ func (f *LoginFlow) completeScan(ctx context.Context) (*LoginOutcome, error) {
 		}
 	}
 
-	// dologin 成功后 SSO 会话已认证：再拉一次登录页，CAS 会直接回 ticket
-	// （与「SSO 会话有效」同一路径）。比提交页面里的 webflow 表单更可靠——
-	// 表单里的 execution 取自首次渲染，dologin 之后可能已失效，提交只会
-	// 重渲染登录页（HTTP 200）。
-	if outcome, ok, err := f.exchangeViaGet(ctx); err != nil {
-		return nil, err
-	} else if ok {
-		return outcome, nil
-	}
-
-	// 兜底：按当前页面（可能是刚重渲染的新页面）的 webflow 表单提交扫码事件
+	// CAS webflow：按登录页 redirectForm 的字段提交扫码事件（真机实测的唯一
+	// 正确形态，多余字段会让 CAS 重渲染登录页）
 	form := url.Values{}
 	for k, v := range f.form {
 		form[k] = append([]string(nil), v...)
@@ -414,14 +409,22 @@ func (f *LoginFlow) completeScan(ctx context.Context) (*LoginOutcome, error) {
 	if err != nil {
 		return nil, fmt.Errorf("提交扫码结果失败（网络不可达或服务异常）：%w", err)
 	}
-	if resp.StatusCode < 300 || resp.StatusCode >= 400 {
-		return nil, fmt.Errorf("提交扫码结果失败：HTTP %d：%s", resp.StatusCode, dumpFailure("cas-post", raw))
+	if resp.StatusCode >= 300 && resp.StatusCode < 400 {
+		location := f.resolve(resp.Header.Get("Location"))
+		if strings.Contains(location, "ticket=") {
+			return f.acceptTicket(ctx, location)
+		}
+	} else {
+		dumpFailure("cas-post", raw)
 	}
-	location := f.resolve(resp.Header.Get("Location"))
-	if !strings.Contains(location, "ticket=") {
-		return nil, fmt.Errorf("统一认证未返回票据（跳转目标 %s），请重试或改用浏览器登录后复制 Cookie", location)
+
+	// 兜底：会话若已认证，重新请求登录页会直接 302 回 ticket
+	if outcome, ok, err := f.exchangeViaGet(ctx); err != nil {
+		return nil, err
+	} else if ok {
+		return outcome, nil
 	}
-	return f.acceptTicket(ctx, location)
+	return nil, fmt.Errorf("提交扫码结果失败：HTTP %d，%s", resp.StatusCode, failureSummary(raw))
 }
 
 // exchangeViaGet 重新请求 SSO 登录页：会话已认证时 CAS 直接 302 回
@@ -440,7 +443,7 @@ func (f *LoginFlow) exchangeViaGet(ctx context.Context) (*LoginOutcome, bool, er
 		outcome, err := f.acceptTicket(ctx, location)
 		return outcome, err == nil, err
 	case http.StatusOK:
-		f.form = extractHiddenInputs(string(raw))
+		f.form = formFields(string(raw))
 		return nil, false, nil
 	default:
 		return nil, false, fmt.Errorf("请求统一认证登录页失败：HTTP %d", resp.StatusCode)
@@ -738,6 +741,24 @@ func extractQRToken(html string) string {
 	return ""
 }
 
+// formFields 取 redirectForm 表单内的字段；页面结构变化时回退到整页 hidden 字段。
+func formFields(html string) url.Values {
+	if form := extractFormFields(html, redirectFormID); form.Get("execution") != "" {
+		return form
+	}
+	return extractHiddenInputs(html)
+}
+
+// extractFormFields 取指定 id 表单内的 hidden 字段（不跨表单混字段）。
+func extractFormFields(html, formID string) url.Values {
+	re := regexp.MustCompile(`(?is)<form[^>]*id="` + regexp.QuoteMeta(formID) + `"[^>]*>(.*?)</form>`)
+	m := re.FindStringSubmatch(html)
+	if len(m) != 2 {
+		return url.Values{}
+	}
+	return extractHiddenInputs(m[1])
+}
+
 // extractHiddenInputs 收集页面全部 hidden 表单字段（CAS webflow 提交需原样带回）。
 func extractHiddenInputs(html string) url.Values {
 	form := url.Values{}
@@ -775,11 +796,17 @@ func extractMFAOptions(html string) []MFAOption {
 // dumpFailure 把失败响应落盘并返回一段摘要（标题 + 命中关键字的文案），
 // 供排查 SSO 侧拒绝收尾的具体原因。
 func dumpFailure(tag string, raw []byte) string {
+	_ = tag
 	path := os.Getenv("REEDFERRY_LOGIN_DUMP")
 	if path == "" {
 		path = "/tmp/reedferry-login-fail.html"
 	}
 	_ = os.WriteFile(path, raw, 0600)
+	return failureSummary(raw)
+}
+
+// failureSummary 从失败响应提取标题与关键字片段（不落盘）。
+func failureSummary(raw []byte) string {
 	html := string(raw)
 	summary := ""
 	if m := titleRe.FindStringSubmatch(html); len(m) == 2 {
@@ -810,7 +837,7 @@ func dumpFailure(tag string, raw []byte) string {
 	if summary == "" {
 		summary = "响应中未找到错误文案"
 	}
-	return strings.Join([]string{strings.TrimSpace(summary), "完整响应已写入 " + path}, "；")
+	return strings.TrimSpace(summary)
 }
 
 // pageError 从重渲染页面提取错误文案（无则返回空串）。
