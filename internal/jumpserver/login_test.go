@@ -101,25 +101,29 @@ type fakeSSO struct {
 	statuses     []string // 依次返回的扫码状态，用尽后返回最后一项
 	silent       bool     // /login 直接回 ticket（SSO 会话有效）
 	dologinMsg   string
-	dologinFail  int // 前 N 次 dologin 返回「未就绪」（已扫码但微信侧尚未完成）
+	dologinFail  int  // 前 N 次 dologin 返回「未就绪」（已扫码但微信侧尚未完成）
+	dologinOK    bool // dologin 是否已成功（成功后 SSO 会话即认证）
+	ticketViaGet bool // dologin 成功后 GET 登录页直接回 ticket（真实环境行为）
 	ticket       string
 	activations  []string
+	postCalls    int // CAS webflow 表单提交次数
 }
 
 func newFakeSSO(t *testing.T, business string) *fakeSSO {
 	t.Helper()
 	f := &fakeSSO{
-		t:          t,
-		business:   business,
-		statuses:   []string{"LOGINING", "LOGINED"},
-		dologinMsg: "登录成功!",
-		ticket:     "ST-good",
+		t:            t,
+		business:     business,
+		statuses:     []string{"LOGINING", "LOGINED"},
+		dologinMsg:   "登录成功!",
+		ticketViaGet: true,
+		ticket:       "ST-good",
 	}
 	mux := http.NewServeMux()
 	mux.HandleFunc("/login", func(w http.ResponseWriter, r *http.Request) {
 		if r.Method == http.MethodGet {
 			http.SetCookie(w, &http.Cookie{Name: "ssoid", Value: "sso-1", Path: "/"})
-			if f.isSilent() {
+			if f.sessionReady() {
 				target := r.URL.Query().Get("service") + "?ticket=" + f.ticket
 				http.Redirect(w, r, target, http.StatusFound)
 				return
@@ -127,6 +131,9 @@ func newFakeSSO(t *testing.T, business string) *fakeSSO {
 			_, _ = w.Write([]byte(ssoPage))
 			return
 		}
+		f.mu.Lock()
+		f.postCalls++
+		f.mu.Unlock()
 		_ = r.ParseForm()
 		if got := r.Form.Get("_eventId"); got != "scanCodeLogin" {
 			t.Errorf("CAS form _eventId: got %q", got)
@@ -181,6 +188,9 @@ func newFakeSSO(t *testing.T, business string) *fakeSSO {
 			_ = json.NewEncoder(w).Encode(map[string]any{"status": 400, "message": "二维码已失效，请扫码重试。"})
 			return
 		}
+		f.mu.Lock()
+		f.dologinOK = true
+		f.mu.Unlock()
 		_ = json.NewEncoder(w).Encode(map[string]any{"status": 200, "message": msg})
 	})
 	mux.HandleFunc("/user/set-activate-flag", func(w http.ResponseWriter, r *http.Request) {
@@ -199,6 +209,13 @@ func (f *fakeSSO) isSilent() bool {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	return f.silent
+}
+
+// sessionReady 判断登录页是否应直接换票：SSO 会话已认证（silent 或 dologin 成功）。
+func (f *fakeSSO) sessionReady() bool {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.silent || (f.ticketViaGet && f.dologinOK)
 }
 
 func (f *fakeSSO) setStatuses(s ...string) {
@@ -339,6 +356,10 @@ func TestLoginQRSuccess(t *testing.T) {
 	if got := sso.pollVersions; len(got) != 2 || got[0] != "1" || got[1] != "2" {
 		t.Errorf("poll versions: %v", got)
 	}
+	// 会话认证后应走 GET 换票，不再提交可能已过期的 webflow 表单
+	if got := sso.postCalls; got != 0 {
+		t.Errorf("CAS form posted %d times, want 0", got)
+	}
 }
 
 func TestLoginSilentTicket(t *testing.T) {
@@ -418,6 +439,32 @@ func TestLoginCompleteWhileStatusStuckLogining(t *testing.T) {
 	final := pollUntilDone(t, flow)
 	if !strings.Contains(final.Cookie, "jms_sessionid=sess-good") {
 		t.Errorf("cookie: %q", final.Cookie)
+	}
+}
+
+// 会话认证后 GET 仍渲染登录页的环境：回落到 webflow 表单提交拿 ticket。
+func TestLoginFallbackFormPost(t *testing.T) {
+	biz, sso := fixture(t)
+	sso.mu.Lock()
+	sso.ticketViaGet = false
+	sso.mu.Unlock()
+
+	flow, outcome, err := NewLoginFlow(context.Background(), biz.server.URL, "")
+	if err != nil {
+		t.Fatalf("NewLoginFlow: %v", err)
+	}
+	if !outcome.NeedQR {
+		t.Fatalf("want QR, got %+v", outcome)
+	}
+	final := pollUntilDone(t, flow)
+	if !strings.Contains(final.Cookie, "jms_sessionid=sess-good") {
+		t.Errorf("cookie: %q", final.Cookie)
+	}
+	sso.mu.Lock()
+	posts := sso.postCalls
+	sso.mu.Unlock()
+	if posts == 0 {
+		t.Error("expected CAS form fallback to be used")
 	}
 }
 

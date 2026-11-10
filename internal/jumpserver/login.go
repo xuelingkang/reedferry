@@ -394,7 +394,17 @@ func (f *LoginFlow) completeScan(ctx context.Context) (*LoginOutcome, error) {
 		}
 	}
 
-	// CAS webflow：以扫码方式提交，换回 service?ticket=
+	// dologin 成功后 SSO 会话已认证：再拉一次登录页，CAS 会直接回 ticket
+	// （与「SSO 会话有效」同一路径）。比提交页面里的 webflow 表单更可靠——
+	// 表单里的 execution 取自首次渲染，dologin 之后可能已失效，提交只会
+	// 重渲染登录页（HTTP 200）。
+	if outcome, ok, err := f.exchangeViaGet(ctx); err != nil {
+		return nil, err
+	} else if ok {
+		return outcome, nil
+	}
+
+	// 兜底：按当前页面（可能是刚重渲染的新页面）的 webflow 表单提交扫码事件
 	form := url.Values{}
 	for k, v := range f.form {
 		form[k] = append([]string(nil), v...)
@@ -405,13 +415,36 @@ func (f *LoginFlow) completeScan(ctx context.Context) (*LoginOutcome, error) {
 		return nil, fmt.Errorf("提交扫码结果失败（网络不可达或服务异常）：%w", err)
 	}
 	if resp.StatusCode < 300 || resp.StatusCode >= 400 {
-		return nil, fmt.Errorf("提交扫码结果失败：HTTP %d", resp.StatusCode)
+		return nil, fmt.Errorf("提交扫码结果失败：HTTP %d（页面可能已过期，请按 r 刷新二维码重试）", resp.StatusCode)
 	}
 	location := f.resolve(resp.Header.Get("Location"))
 	if !strings.Contains(location, "ticket=") {
 		return nil, fmt.Errorf("统一认证未返回票据（跳转目标 %s），请重试或改用浏览器登录后复制 Cookie", location)
 	}
 	return f.acceptTicket(ctx, location)
+}
+
+// exchangeViaGet 重新请求 SSO 登录页：会话已认证时 CAS 直接 302 回
+// service?ticket=（ok=true）；仍渲染登录页（HTTP 200）时刷新表单字段并返回 ok=false。
+func (f *LoginFlow) exchangeViaGet(ctx context.Context) (*LoginOutcome, bool, error) {
+	raw, resp, err := f.get(ctx, f.loginURL)
+	if err != nil {
+		return nil, false, fmt.Errorf("请求统一认证登录页失败（网络不可达或服务异常）：%w", err)
+	}
+	switch resp.StatusCode {
+	case http.StatusFound, http.StatusSeeOther, http.StatusTemporaryRedirect:
+		location := f.resolve(resp.Header.Get("Location"))
+		if !strings.Contains(location, "ticket=") {
+			return nil, false, nil
+		}
+		outcome, err := f.acceptTicket(ctx, location)
+		return outcome, err == nil, err
+	case http.StatusOK:
+		f.form = extractHiddenInputs(string(raw))
+		return nil, false, nil
+	default:
+		return nil, false, fmt.Errorf("请求统一认证登录页失败：HTTP %d", resp.StatusCode)
+	}
 }
 
 // acceptTicket 带票据回跳业务侧，服务端校验后种会话 Cookie，再按业务侧
