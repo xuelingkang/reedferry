@@ -262,12 +262,8 @@ func (f *LoginFlow) openSSO(ctx context.Context) (*LoginOutcome, error) {
 		}
 		return &LoginOutcome{NeedQR: true, QR: f.qr}, nil
 	case http.StatusFound, http.StatusSeeOther, http.StatusTemporaryRedirect:
-		// SSO 会话有效：免扫码直接回 ticket
-		location := f.resolve(resp.Header.Get("Location"))
-		if !strings.Contains(location, "ticket=") {
-			return nil, fmt.Errorf("统一认证登录页跳转异常（%s）", location)
-		}
-		return f.acceptTicket(ctx, location)
+		// SSO 会话有效（TGC 未过期）：免扫码直接换票，形态与扫码后一致
+		return f.followToService(ctx, f.resolveFrom(f.loginURL, resp.Header.Get("Location")))
 	default:
 		return nil, fmt.Errorf("打开统一认证登录页失败：HTTP %d", resp.StatusCode)
 	}
@@ -432,11 +428,7 @@ func (f *LoginFlow) exchangeViaGet(ctx context.Context) (*LoginOutcome, bool, er
 	}
 	switch resp.StatusCode {
 	case http.StatusFound, http.StatusSeeOther, http.StatusTemporaryRedirect:
-		location := f.resolve(resp.Header.Get("Location"))
-		if !strings.Contains(location, "ticket=") {
-			return nil, false, nil
-		}
-		outcome, err := f.acceptTicket(ctx, location)
+		outcome, err := f.followToService(ctx, f.resolveFrom(f.loginURL, resp.Header.Get("Location")))
 		return outcome, err == nil, err
 	case http.StatusOK:
 		f.form = formFields(string(raw))

@@ -129,8 +129,8 @@ func newFakeSSO(t *testing.T, business string) *fakeSSO {
 		if r.Method == http.MethodGet {
 			http.SetCookie(w, &http.Cookie{Name: "ssoid", Value: "sso-1", Path: "/"})
 			if f.sessionReady() {
-				target := r.URL.Query().Get("service") + "?ticket=" + f.ticket
-				http.Redirect(w, r, target, http.StatusFound)
+				serviceURL := r.URL.Query().Get("service") + "?ticket=" + f.ticket
+				http.Redirect(w, r, f.server.URL+"/user/service-route?routeTicket=rt-silent&serviceUrl="+url.QueryEscape(serviceURL), http.StatusFound)
 				return
 			}
 			_, _ = w.Write([]byte(ssoPage))

@@ -757,8 +757,8 @@ config   ──调用──> jumpserver（无——校验由 repl/session 完成
 4. **扫码挑战**：`GET /user/qrcode/qrcode-login/v2/content?token={qrToken}&service={service}` → `{data:{content, queryToken:{token,version}}}`；`content` 即二维码承载的 URL（`https://sso.zxxk.com/login?key=…&type=qrcode-login`），不是微信开放平台的 `qrconnect` 链接。
 5. **状态轮询**：`GET /user/wechat-applet/logincheck?token=&version=`（version 每次自增；缺任一参数或跨会话返回 `data:null`，等同于「未扫码」）→ `LOGINING`（已扫码待授权）/ `LOGINED`（完成）/ `QUIT_LOGIN`（微信侧取消）/ `ACCOUNT_BIND`（微信未绑定账号）/ `EXPIRED`（过期，可刷新）。
 6. **扫码完成收尾**：`GET /user/wechat-applet/dologin?service=…` → `{status, message}`；无扫码状态时返回「二维码已失效」（它是扫码会话的收尾，不是会话探针）。message 含「同意」表示该账号首次登录需同意隐私协议，须先 `POST /user/set-activate-flag`（表单 `loginInfo`），否则停在「扫码成功进不去」。
-7. **CAS 换票**：`POST` 回 SSO 登录页，表单带上页面全部 hidden 字段并把 `_eventId` 覆盖为 `scanCodeLogin` → 302 `service?ticket=ST-…`。
-8. **ticket 回跳**：`GET {业务}/core/auth/cas/login/?ticket=…`，服务端回 SSO 校验后种 `jms_sessionid`；伪造 ticket 只会 302 到 `/` 且 API 401（正常拒绝，不是端点故障）。随后仍可能 302 → `/core/auth/login/guard/` → `/core/auth/login/mfa/`（业务侧 2FA），提交 `code`+`mfa_type` 与旧流程一致。
+7. **CAS 换票**：`POST` 回 SSO 登录页，只提交 `id="redirectForm"` 表单内的字段（真机实测仅 `execution` / `flowId` / `_eventId` 三个，把手机验证码表单的字段一并塞进去会被重渲染登录页）→ 302 到 `https://sso.xkw.com/user/service-route?routeTicket=…&serviceUrl=<业务回调>%3Fticket%3DST-…`：**票据是编码在 `serviceUrl` 参数里**，同时响应下发 `TGC`（票据授予票据，免扫码续期靠它）。
+8. **ticket 回跳**：客户端按浏览器方式跟随这条 302 链（`service-route` 网关再 302 到业务回调），不能只判断 Location 里有没有明文 `ticket=`；`GET {业务}/core/auth/cas/login/?ticket=…`，服务端回 SSO 校验后种 `jms_sessionid`；伪造 ticket 只会 302 到 `/` 且 API 401（正常拒绝，不是端点故障）。随后仍可能 302 → `/core/auth/login/guard/` → `/core/auth/login/mfa/`（业务侧 2FA），提交 `code`+`mfa_type` 与旧流程一致。
 9. **落地页消费**：登录后必须先 GET 落地页再序列化 Cookie——`jms_csrftoken` 只在渲染带 CSRF 的页面时种下；只拿到 302 Location 就序列化，后续 `connection-token` 会报 `token from header incorrect`。
 10. **落盘**：业务域 Cookie（`jms_sessionid` / `jms_csrftoken`）写 `cookie`，SSO 域 Cookie（CAS 会话）写 `sso_cookie`；两者按域分开序列化，业务请求不携带 SSO Cookie。
 
